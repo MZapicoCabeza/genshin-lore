@@ -1,0 +1,8 @@
+.env
+.venv/
+.idea/
+__pycache__/
+*.pyc
+cache_traducciones.json
+grafo_entidades.json
+prueba.py
