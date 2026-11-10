@@ -100,15 +100,27 @@ SUFIJOS_TITULO_EXCLUIDOS = (
     "(instance)", "(gadget)", "(furnishing)", "(achievement)",
     "(soundtrack)", "(card)", "(event)", "(consumable)", "(material)",
     "treasure compass", "resonance stone", "wind catcher", "four-leaf sigil",
-    "boulder", "mushroom", "vortex", "mechanism", "switch", "valve"
+    "boulder", "mushroom", "vortex", "mechanism", "switch", "valve",
+    "bulletin board", "advertisement board", "message board", "noticeboard"
 )
 
 INFOBOXES_NO_LORE_REGEX = re.compile(
-    r"\{\{\s*(?:Exploration Infobox|Furnishing Infobox|Furnishing Set Infobox|"
+    r"\{\{\s*(?:Talent Infobox|Constellation Infobox|Wish Infobox|Event Wish|"
+    r"Exploration Infobox|Furnishing Infobox|Furnishing Set Infobox|"
     r"Food Infobox|Recipe Infobox|Achievement Infobox|Achievement Category Infobox|"
     r"Soundtrack Infobox|Album Infobox|Genius Invokation TCG|TCG|"
     r"Outfit Infobox|Wind Glider Infobox|Namecard Infobox|Shop Infobox|"
     r"Wildlife Infobox|Fish Infobox|Domain Infobox)",
+    flags=re.IGNORECASE,
+)
+
+PATRON_LINEA_HABILIDAD_O_BANNER = re.compile(
+    r"\b(?:CRIT Rate|CRIT DMG|DMG Bonus|Normal Attack|Charged Attack|Plunging Attack|"
+    r"Elemental Skill|Elemental Burst|Ascension Passive|Utility Passive|Nightrealm's Gift Passive|"
+    r"Event Wish|Character Event Wish|Chronicled Wish|Weapon Event Wish|Standard Wish|"
+    r"(?:1st|2nd|3rd|4th|5th|6th)\s+constellation|"
+    r"The\s+(?:talent|attack|passive|constellation|skill|burst)\b|"
+    r"Lv\.\s*\d+)\b",
     flags=re.IGNORECASE,
 )
 
@@ -477,7 +489,7 @@ def procesar_pagina(titulo_pagina, wikitext_bruto):
             p_strip = parrafo.strip()
             if not p_strip or len(p_strip) < 3 or p_strip.startswith(("{|", "|", "!", "{{", "}}")):
                 continue
-            if re.search(r"\b(CRIT Rate|CRIT DMG|DMG Bonus|Normal Attack|Elemental Burst|Lv\. \d+)\b", p_strip, flags=re.IGNORECASE):
+            if PATRON_LINEA_HABILIDAD_O_BANNER.search(p_strip):
                 continue
             parrafos_seccion.append(p_strip)
 
@@ -493,7 +505,7 @@ def procesar_pagina(titulo_pagina, wikitext_bruto):
             linea = linea.strip()
             if not linea or len(linea) < 20 or linea.startswith(("{|", "|", "!", "{{", "}}")):
                 continue
-            if re.search(r"\b(CRIT Rate|CRIT DMG|DMG Bonus|Normal Attack|Elemental Burst|Lv\. \d+)\b", linea, flags=re.IGNORECASE):
+            if PATRON_LINEA_HABILIDAD_O_BANNER.search(linea):
                 continue
             entidades_brutas_linea = extraer_entidades_brutas_de_fragmento(linea)
             parrafo_limpio = limpiar_texto_plano(linea)
@@ -945,4 +957,4 @@ def ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=
 
 if __name__ == "__main__":
     reanudar = "--reanudar" in sys.argv
-    ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=8000, borrar_antes=not reanudar)
+    ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=80000, borrar_antes=not reanudar)
