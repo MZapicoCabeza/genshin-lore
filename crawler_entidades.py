@@ -93,7 +93,11 @@ NO_ENTIDADES = {
     "furnishings", "crafting bench", "stamina", "firearm", "train", "monument",
     "teleport waypoint", "statue of the seven", "treasure compass", "fishing",
     "cooking", "forging", "alchemy", "serenitea pot", "genius invokation tcg",
-    "spiral abyss", "imaginarium theater", "wind glider", "namecard"
+    "spiral abyss", "imaginarium theater", "wind glider", "namecard",
+    "exploration", "map", "mini-map", "minimap", "main city", "version",
+    "version history", "system", "inventory", "battle pass", "co-op mode",
+    "photo mode", "loading screen", "tutorial", "tutorials", "furnishing set",
+    "furnishing sets", "adeptal energy", "realm currency", "trust rank"
 }
 
 SUFIJOS_TITULO_EXCLUIDOS = (
@@ -110,7 +114,7 @@ INFOBOXES_NO_LORE_REGEX = re.compile(
     r"Food Infobox|Recipe Infobox|Achievement Infobox|Achievement Category Infobox|"
     r"Soundtrack Infobox|Album Infobox|Genius Invokation TCG|TCG|"
     r"Outfit Infobox|Wind Glider Infobox|Namecard Infobox|Shop Infobox|"
-    r"Wildlife Infobox|Fish Infobox|Domain Infobox)",
+    r"Wildlife Infobox|Fish Infobox|Domain Infobox|System Infobox|Version|Update)",
     flags=re.IGNORECASE,
 )
 
@@ -153,6 +157,7 @@ def es_entidad_valida(nombre: str) -> bool:
         "file:", "category:", "special:", "template:", "user:", "help:",
         "talk:", "module:", "media:", "project:", "fandom:",
         "genshin impact wiki:", "thread:", "blog:", "forum:",
+        "version ", "version/",
     )
     if nombre.strip().startswith(":") or lower.startswith(prefijos) or lower in NO_ENTIDADES or lower in HUBS_INDICE:
         return False
