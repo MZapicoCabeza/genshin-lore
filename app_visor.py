@@ -319,33 +319,34 @@ def asegurar_articulo_completo_wiki(session_neo4j, id_entidad: str, texto_actual
                     id=id_entidad,
                     texto=texto_completo,
                 )
-                # Actualizar también sus Chunks Jerárquicos Small-to-Big y Embeddings en Neo4j
-                chunks = crawler_entidades.generar_chunks_jerarquicos_small_to_big(id_entidad, texto_completo)
-                if chunks:
-                    vecs = crawler_entidades.calcular_embeddings_lote([c["texto_embedding"] for c in chunks])
-                    if len(vecs) == len(chunks):
-                        for c, v in zip(chunks, vecs):
-                            c["embedding"] = v
-                        session_neo4j.run(
-                            """
-                            MATCH (e:Entity {id: $entidad_id})
-                            OPTIONAL MATCH (e)-[:HAS_CHUNK]->(old_c:Chunk)
-                            DETACH DELETE old_c
-                            WITH e
-                            UNWIND $chunks AS ch
-                            MERGE (c:Chunk {id: ch.id})
-                            SET c.entidad_id = ch.entidad_id,
-                                c.seccion = ch.seccion,
-                                c.orden = ch.orden,
-                                c.texto = ch.texto,
-                                c.texto_padre = ch.texto_padre,
-                                c.url_wiki = ch.url_wiki,
-                                c.embedding = ch.embedding
-                            MERGE (e)-[:HAS_CHUNK]->(c)
-                            """,
-                            entidad_id=id_entidad,
-                            chunks=chunks,
-                        )
+                # En local (con RAM de sobra) indexamos también los embeddings; en Render Free (512 MB RAM) evitamos cargar el modelo ONNX pesado
+                if not os.getenv("RENDER"):
+                    chunks = crawler_entidades.generar_chunks_jerarquicos_small_to_big(id_entidad, texto_completo)
+                    if chunks:
+                        vecs = crawler_entidades.calcular_embeddings_lote([c["texto_embedding"] for c in chunks])
+                        if len(vecs) == len(chunks):
+                            for c, v in zip(chunks, vecs):
+                                c["embedding"] = v
+                            session_neo4j.run(
+                                """
+                                MATCH (e:Entity {id: $entidad_id})
+                                OPTIONAL MATCH (e)-[:HAS_CHUNK]->(old_c:Chunk)
+                                DETACH DELETE old_c
+                                WITH e
+                                UNWIND $chunks AS ch
+                                MERGE (c:Chunk {id: ch.id})
+                                SET c.entidad_id = ch.entidad_id,
+                                    c.seccion = ch.seccion,
+                                    c.orden = ch.orden,
+                                    c.texto = ch.texto,
+                                    c.texto_padre = ch.texto_padre,
+                                    c.url_wiki = ch.url_wiki,
+                                    c.embedding = ch.embedding
+                                MERGE (e)-[:HAS_CHUNK]->(c)
+                                """,
+                                entidad_id=id_entidad,
+                                chunks=chunks,
+                            )
                 return texto_completo
     except Exception as e:
         print(f"Aviso descargando artículo completo de '{id_entidad}': {e}")
@@ -552,12 +553,16 @@ def obtener_avatar_entidad(entidad_id: str):
             r = http_session.get(url_img, timeout=6)
             if r.status_code == 200 and r.content:
                 mime = r.headers.get("content-type", "image/webp")
+                if len(CACHE_AVATARES) > 200:
+                    CACHE_AVATARES.pop(next(iter(CACHE_AVATARES)), None)
                 CACHE_AVATARES[key] = (r.content, mime)
                 return Response(content=r.content, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
         except Exception:
             pass
 
     svg_bytes = generar_svg_fallback(canon)
+    if len(CACHE_AVATARES) > 200:
+        CACHE_AVATARES.pop(next(iter(CACHE_AVATARES)), None)
     CACHE_AVATARES[key] = (svg_bytes, "image/svg+xml")
     return Response(content=svg_bytes, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
 
@@ -656,42 +661,63 @@ def consultar_chatbot_graphrag(req: PeticionChat):
     if not pregunta:
         return {"error": "Escribe una pregunta para consultar el archivo."}
 
-    vectores_q = crawler_entidades.calcular_embeddings_lote([pregunta])
-    if not vectores_q:
-        return {"error": "No se pudo calcular el embedding de la consulta."}
-    vec_pregunta = vectores_q[0]
-
     chunks_recuperados = []
     entidades_clave = []
 
+    palabras_clave = [
+        p.strip("¿?¡!.,;:()\"'")
+        for p in pregunta.split()
+        if len(p.strip("¿?¡!.,;:()\"'")) >= 4
+    ]
+
     with driver.session() as session:
-        # 1. Búsqueda vectorial sobre el índice Neo4j 'chunk_embeddings'
-        try:
-            res_vec = session.run(
-                """
-                CALL db.index.vector.queryNodes('chunk_embeddings', 10, $vec)
-                YIELD node AS c, score
-                RETURN c.id AS chunk_id,
-                       c.entidad_id AS entidad_id,
-                       c.seccion AS seccion,
-                       c.texto AS texto_hijo,
-                       c.texto_padre AS texto_padre,
-                       c.url_wiki AS url_wiki,
-                       score
-                ORDER BY score DESC
-                """,
-                vec=vec_pregunta,
-            ).data()
-            chunks_recuperados.extend(res_vec)
-        except Exception as e:
-            print(f"Aviso en consulta vectorial Neo4j: {e}")
+        # 1. Búsqueda vectorial sobre el índice Neo4j 'chunk_embeddings' (en local) o búsqueda léxica/semántica ligera (en Render 512MB)
+        if not os.getenv("RENDER"):
+            try:
+                vectores_q = crawler_entidades.calcular_embeddings_lote([pregunta])
+                if vectores_q:
+                    res_vec = session.run(
+                        """
+                        CALL db.index.vector.queryNodes('chunk_embeddings', 10, $vec)
+                        YIELD node AS c, score
+                        RETURN c.id AS chunk_id,
+                               c.entidad_id AS entidad_id,
+                               c.seccion AS seccion,
+                               c.texto AS texto_hijo,
+                               c.texto_padre AS texto_padre,
+                               c.url_wiki AS url_wiki,
+                               score
+                        ORDER BY score DESC
+                        """,
+                        vec=vectores_q[0],
+                    ).data()
+                    chunks_recuperados.extend(res_vec)
+            except Exception as e:
+                print(f"Aviso en consulta vectorial Neo4j: {e}")
+        elif palabras_clave:
+            try:
+                res_kw = session.run(
+                    """
+                    MATCH (c:Chunk)
+                    WITH c, size([w IN $palabras WHERE toLower(c.texto) CONTAINS toLower(w) OR toLower(c.entidad_id) CONTAINS toLower(w)]) AS coincidencias
+                    WHERE coincidencias > 0
+                    RETURN c.id AS chunk_id,
+                           c.entidad_id AS entidad_id,
+                           c.seccion AS seccion,
+                           c.texto AS texto_hijo,
+                           c.texto_padre AS texto_padre,
+                           c.url_wiki AS url_wiki,
+                           toFloat(coincidencias) / toFloat(size($palabras)) AS score
+                    ORDER BY coincidencias DESC
+                    LIMIT 10
+                    """,
+                    palabras=palabras_clave,
+                ).data()
+                chunks_recuperados.extend(res_kw)
+            except Exception as e:
+                print(f"Aviso en consulta de chunks en Render: {e}")
 
         # 2. Detectar entidades mencionadas explícitamente en la pregunta (o la entidad foco actual)
-        palabras_clave = [
-            p.strip("¿?¡!.,;:()\"'")
-            for p in pregunta.split()
-            if len(p.strip("¿?¡!.,;:()\"'")) >= 4
-        ]
         entidades_mencionadas = []
         if palabras_clave:
             res_ent = session.run(
@@ -1393,7 +1419,7 @@ def obtener_padres_e_hijos(entidad_id: str):
         }
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 @app.get("/irminsul", response_class=HTMLResponse)
 def interfaz_web():
     return r"""
