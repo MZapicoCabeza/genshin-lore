@@ -52,18 +52,23 @@ HUBS_INDICE = {
     "lore", "timeline", "history", "books", "book", "archive"
 }
 
-# 2. SECCIONES EXCLUSIVAMENTE DE MECÁNICAS NUMÉRICAS / META A IGNORAR
+# 2. SECCIONES EXCLUSIVAMENTE DE MECÁNICAS NUMÉRICAS / META / PUZLES A IGNORAR
 # Conservamos todas las secciones útiles para lore y enciclopedia (Profile, Story, History, Trivia, Etymology, Notes, Character Stories, etc.)
 SECCIONES_IGNORADAS = {
     "combat info", "stats", "ascensions and stats", "ascensions", "talents",
     "constellations", "attributes", "stat scaling", "scaling", "abilities",
-    "mechanics", "strategy", "rewards", "possible rewards", "drops",
+    "mechanics", "exploration", "exploration mechanics", "interactive objects",
+    "environmental hazards", "puzzles", "gadgets", "wildlife", "enemies",
+    "common enemies", "elite enemies", "normal bosses", "weekly bosses",
+    "local specialties", "materials", "furnishings", "recipes", "soundtracks",
+    "strategy", "rewards", "possible rewards", "drops",
     "how to obtain", "availability", "shop", "recipe", "crafting",
     "character ascension", "talent leveling", "gameplay notes", "gameplay info",
     "talent upgrade", "character event wishes", "chronicled wishes",
     "change history", "other languages", "navigation", "gallery", "animations",
     "references", "voice-overs", "mail", "outfit", "outfits", "namecard",
-    "videos", "paimon's paintings", "genius invokation tcg"
+    "videos", "paimon's paintings", "genius invokation tcg", "achievements",
+    "npc", "npcs", "quests", "domains", "features"
 }
 
 # 3. PLANTILLAS DE COMBATE/INTERFAZ A ELIMINAR ANTES DE LEER
@@ -73,7 +78,7 @@ PLANTILLAS_IGNORADAS_REGEX = (
     r"Voice-Overs|Dialogue|Shop|Recipe|Drop|Character Tabs)[^}]*\}\}"
 )
 
-# 4. NO-ENTIDADES (Conceptos de mecánicas del juego que nunca deben ser nodos)
+# 4. NO-ENTIDADES (Conceptos de mecánicas del juego, puzles y páginas meta que nunca deben ser nodos)
 NO_ENTIDADES = {
     "genshin impact", "hoyolab", "hoyoverse", "mihoyo", "characters", "character",
     "npc", "npcs", "quests", "quest", "archon quest", "archon quests",
@@ -83,8 +88,29 @@ NO_ENTIDADES = {
     "bosses", "boss", "wishes", "wish", "primogem", "primogems", "mora",
     "adventure rank", "original resin", "hero's wit", "atk", "def", "hp",
     "elemental mastery", "energy recharge", "crit rate", "crit dmg",
-    "normal attack", "elemental skill", "elemental burst", "traveler"
+    "normal attack", "charged attack", "plunging attack", "elemental skill",
+    "elemental burst", "traveler", "food", "gadget", "gadgets", "furnishing",
+    "furnishings", "crafting bench", "stamina", "firearm", "train", "monument",
+    "teleport waypoint", "statue of the seven", "treasure compass", "fishing",
+    "cooking", "forging", "alchemy", "serenitea pot", "genius invokation tcg",
+    "spiral abyss", "imaginarium theater", "wind glider", "namecard"
 }
+
+SUFIJOS_TITULO_EXCLUIDOS = (
+    "(instance)", "(gadget)", "(furnishing)", "(achievement)",
+    "(soundtrack)", "(card)", "(event)", "(consumable)", "(material)",
+    "treasure compass", "resonance stone", "wind catcher", "four-leaf sigil",
+    "boulder", "mushroom", "vortex", "mechanism", "switch", "valve"
+)
+
+INFOBOXES_NO_LORE_REGEX = re.compile(
+    r"\{\{\s*(?:Exploration Infobox|Furnishing Infobox|Furnishing Set Infobox|"
+    r"Food Infobox|Recipe Infobox|Achievement Infobox|Achievement Category Infobox|"
+    r"Soundtrack Infobox|Album Infobox|Genius Invokation TCG|TCG|"
+    r"Outfit Infobox|Wind Glider Infobox|Namecard Infobox|Shop Infobox|"
+    r"Wildlife Infobox|Fish Infobox|Domain Infobox)",
+    flags=re.IGNORECASE,
+)
 
 CACHE_CANONICO: dict[str, str] = {}
 http_session = requests.Session()
@@ -111,11 +137,57 @@ def es_entidad_valida(nombre: str) -> bool:
     if not nombre or len(nombre) < 2:
         return False
     lower = nombre.strip().lstrip(":").strip().lower()
-    prefijos = ("file:", "category:", "special:", "template:", "user:", "help:", "talk:", "module:", "media:", "project:", "fandom:")
+    prefijos = (
+        "file:", "category:", "special:", "template:", "user:", "help:",
+        "talk:", "module:", "media:", "project:", "fandom:",
+        "genshin impact wiki:", "thread:", "blog:", "forum:",
+    )
     if nombre.strip().startswith(":") or lower.startswith(prefijos) or lower in NO_ENTIDADES or lower in HUBS_INDICE:
+        return False
+    if any(lower.endswith(suf) or suf in lower for suf in SUFIJOS_TITULO_EXCLUIDOS):
         return False
     if re.match(r"^[a-z]{2,3}(?:-[a-z]+)?:", lower):
         return False
+    return True
+
+
+def es_pagina_relevante_para_lore(titulo: str, wikitext: str) -> bool:
+    """
+    Filtra objetos de exploración (puzles, antorchas, setas, válvulas), muebles, recetas,
+    logros, cartas TCG, materiales genéricos y enemigos menores sin lore.
+    """
+    if not wikitext:
+        return False
+    if titulo.lower() in HUBS_INDICE:
+        return True
+    if not es_entidad_valida(titulo):
+        return False
+
+    cabecera = wikitext[:3500]
+    # 1. Descartar inmediatamente puzles de exploración, muebles, comida, logros, música, TCG, etc.
+    if INFOBOXES_NO_LORE_REGEX.search(cabecera):
+        return False
+
+    # 2. En objetos ({{Item Infobox}}), descartar gadgets, ingredientes y materiales salvo que tengan sección de Lore real
+    if re.search(r"\{\{\s*Item Infobox", cabecera, flags=re.IGNORECASE):
+        m_tipo = re.search(r"\|\s*type\s*=\s*([^\n|]+)", cabecera, flags=re.IGNORECASE)
+        tipo_item = (m_tipo.group(1).strip().lower() if m_tipo else "")
+        tipos_gameplay = (
+            "gadget", "food", "consumable", "furnishing", "cooking ingredient",
+            "local specialty", "bait", "fish", "seed", "wood", "forging",
+            "character exp", "weapon enhancement", "currency", "bundle",
+        )
+        if any(t in tipo_item for t in tipos_gameplay):
+            return False
+        # Si no tiene sección ==Story== o ==Lore== explícita y es corto, descartar
+        if not re.search(r"^==+\s*(?:Story|Lore|History)\s*==+", wikitext, flags=re.IGNORECASE | re.MULTILINE):
+            return False
+
+    # 3. En enemigos comunes (Slimes, Samachurls, etc.), descartar si son enemigos menores sin historia extensa
+    if re.search(r"\{\{\s*Enemy Infobox", cabecera, flags=re.IGNORECASE):
+        if re.search(r"\|\s*type\s*=\s*Common Enemies", cabecera, flags=re.IGNORECASE) and len(wikitext) < 3500:
+            return False
+
     return True
 
 
@@ -829,17 +901,30 @@ def ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=
             if actual.lower() in visitados or prof > max_profundidad:
                 continue
             visitados.add(actual.lower())
-            paginas_procesadas += 1
 
             es_hub_actual = actual.lower() in HUBS_INDICE
-            icono = "🗂️ [HUB]" if es_hub_actual else "👤 [ENTITY]"
-            print(f"[{paginas_procesadas}/{max_paginas_seguridad}] {icono} (Depth {prof}) '{actual}'...")
+            if not es_hub_actual and not es_entidad_valida(actual):
+                with driver.session() as s_del:
+                    s_del.run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual)
+                continue
 
             wikitext = obtener_wikitexto_lore(actual)
-            if not wikitext:
+            if not wikitext or not es_pagina_relevante_para_lore(actual, wikitext):
+                if not es_hub_actual:
+                    with driver.session() as s_del:
+                        s_del.run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual)
                 continue
 
             texto_web, relaciones, vecinos = procesar_pagina(actual, wikitext)
+            # Descartar micro-artículos de mecánicas/objetos sin apenas contenido enciclopédico
+            if not es_hub_actual and len(texto_web.strip()) < 420 and len(relaciones) < 3:
+                with driver.session() as s_del:
+                    s_del.run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual)
+                continue
+
+            paginas_procesadas += 1
+            icono = "🗂️ [HUB]" if es_hub_actual else "👤 [ENTITY]"
+            print(f"[{paginas_procesadas}/{max_paginas_seguridad}] {icono} (Depth {prof}) '{actual}'...")
             guardar_en_neo4j(driver, actual, texto_web, relaciones)
             print(f"   💾 Texto enciclopédico ({len(texto_web)} chars) | +{len(relaciones)} relaciones | +{len(vecinos)} entidades.")
 
