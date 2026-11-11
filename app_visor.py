@@ -674,7 +674,9 @@ def consultar_chatbot_graphrag(req: PeticionChat):
     ]
 
     with driver.session() as session:
-        # 1. Búsqueda vectorial sobre el índice Neo4j 'chunk_embeddings' (en local) o búsqueda léxica/semántica ligera (en Render 512MB)
+        textos_juego_recuperados = []
+        afirmaciones_recuperadas = []
+        # 1. Búsqueda vectorial sobre los índices Neo4j ('chunk_embeddings' + 'textojuego_embeddings') o léxica (en Render)
         if not os.getenv("RENDER"):
             try:
                 vectores_q = crawler_entidades.calcular_embeddings_lote([pregunta])
@@ -695,6 +697,21 @@ def consultar_chatbot_graphrag(req: PeticionChat):
                         vec=vectores_q[0],
                     ).data()
                     chunks_recuperados.extend(res_vec)
+
+                    try:
+                        res_tj_vec = session.run(
+                            """
+                            CALL db.index.vector.queryNodes('textojuego_embeddings', 6, $vec)
+                            YIELD node AS t, score
+                            RETURN t.id AS id, t.tipo AS tipo, t.titulo AS titulo, t.titulo_obra AS obra,
+                                   t.texto AS texto, t.version_juego AS version_juego, t.entidad_id AS entidad_id, score
+                            ORDER BY score DESC
+                            """,
+                            vec=vectores_q[0],
+                        ).data()
+                        textos_juego_recuperados.extend(res_tj_vec)
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"Aviso en consulta vectorial Neo4j: {e}")
         elif palabras_clave:
@@ -717,6 +734,21 @@ def consultar_chatbot_graphrag(req: PeticionChat):
                     palabras=palabras_clave,
                 ).data()
                 chunks_recuperados.extend(res_kw)
+
+                res_tj_kw = session.run(
+                    """
+                    MATCH (t:TextoJuego)
+                    WITH t, size([w IN $palabras WHERE toLower(t.texto) CONTAINS toLower(w) OR toLower(t.titulo) CONTAINS toLower(w)]) AS coincidencias
+                    WHERE coincidencias > 0
+                    RETURN t.id AS id, t.tipo AS tipo, t.titulo AS titulo, t.titulo_obra AS obra,
+                           t.texto AS texto, t.version_juego AS version_juego, t.entidad_id AS entidad_id,
+                           toFloat(coincidencias) / toFloat(size($palabras)) AS score
+                    ORDER BY coincidencias DESC
+                    LIMIT 5
+                    """,
+                    palabras=palabras_clave,
+                ).data()
+                textos_juego_recuperados.extend(res_tj_kw)
             except Exception as e:
                 print(f"Aviso en consulta de chunks en Render: {e}")
 
@@ -783,12 +815,16 @@ def consultar_chatbot_graphrag(req: PeticionChat):
             if ce and ce.lower() not in vistas_ent and len(entidades_clave) < 7:
                 vistas_ent.add(ce.lower())
                 entidades_clave.append(ce)
+        for tj in textos_juego_recuperados:
+            ce = obtener_nombre_canonico(tj.get("entidad_id") or "")
+            if ce and ce.lower() not in vistas_ent and len(entidades_clave) < 7:
+                vistas_ent.add(ce.lower())
+                entidades_clave.append(ce)
 
         # 3. Recorrido de Grafo (1 salto RELATED_TO) desde las entidades clave
         relaciones_recuperadas = []
-        textos_juego_recuperados = []
         if entidades_clave:
-            # Recuperar textos canon del juego vinculados a estas entidades clave
+            # Recuperar textos canon del juego vinculados a estas entidades clave (sin duplicar los ya hallados)
             res_tj = session.run(
                 """
                 MATCH (t:TextoJuego)
@@ -796,13 +832,29 @@ def consultar_chatbot_graphrag(req: PeticionChat):
                    OR any(e IN $ents WHERE (t)-[:SOBRE]->(:Entity {id: e}))
                    OR any(e IN $ents WHERE (t)-[:MENCIONA]->(:Entity {id: e}))
                 RETURN t.id AS id, t.tipo AS tipo, t.titulo AS titulo, t.titulo_obra AS obra,
-                       t.texto AS texto, t.version_juego AS version_juego
+                       t.texto AS texto, t.version_juego AS version_juego, t.entidad_id AS entidad_id
                 ORDER BY t.tipo, t.titulo
                 LIMIT 6
                 """,
                 ents=entidades_clave
             ).data()
-            textos_juego_recuperados.extend(res_tj)
+            ids_tj_ya = {t["id"] for t in textos_juego_recuperados}
+            for tj in res_tj:
+                if tj["id"] not in ids_tj_ya:
+                    textos_juego_recuperados.append(tj)
+                    ids_tj_ya.add(tj["id"])
+
+            # Recuperar también afirmaciones externas / teorías vinculadas para contrastar canon vs teoría
+            afirmaciones_recuperadas = session.run(
+                """
+                MATCH (a:Afirmacion)
+                WHERE a.entidad_id IN $ents AND a.estado <> 'refutada'
+                RETURN a.entidad_id AS entidad_id, a.texto AS texto, a.certeza AS certeza,
+                       a.tipo_fuente AS tipo_fuente, a.fuente_titulo AS fuente_titulo, a.version_juego AS version_juego
+                LIMIT 8
+                """,
+                ents=entidades_clave,
+            ).data()
 
             res_rels = session.run(
                 """
@@ -887,11 +939,17 @@ def consultar_chatbot_graphrag(req: PeticionChat):
         )
 
     bloques_contexto_juego = []
-    for idx, tj in enumerate(textos_juego_recuperados[:6], start=1):
+    for idx, tj in enumerate(textos_juego_recuperados[:8], start=1):
         cuerpo_tj = (tj.get("texto") or "").strip()[:1800]
         ver_tj = f" (v{tj['version_juego']})" if tj.get("version_juego") else ""
         bloques_contexto_juego.append(
             f"[Texto Canon del Juego TJ{idx} | Tipo: {tj.get('tipo', 'juego')} | Título: {tj.get('titulo')}{ver_tj} | Obra: {tj.get('obra')}]\n{cuerpo_tj}"
+        )
+
+    bloques_contexto_afirm = []
+    for idx, af in enumerate(afirmaciones_recuperadas[:8], start=1):
+        bloques_contexto_afirm.append(
+            f"[Afirmación Externa A{idx} | Entidad: {af.get('entidad_id')} | Certeza: {af.get('certeza')} | Fuente: {af.get('fuente_titulo') or af.get('tipo_fuente')}]\n{af.get('texto')}"
         )
 
     contexto_total = (
@@ -901,17 +959,19 @@ def consultar_chatbot_graphrag(req: PeticionChat):
         + ("\n\n".join(bloques_contexto_chunks) if bloques_contexto_chunks else "Sin fragmentos directos.")
         + "\n\n=== RELACIONES Y CITAS DEL GRAFO DE CONOCIMIENTO (NEO4J) ===\n"
         + ("\n\n".join(bloques_contexto_rels) if bloques_contexto_rels else "Sin relaciones adicionales.")
+        + ("\n\n=== AFIRMACIONES EXTERNAS, INFERENCIAS Y TEORÍAS ===\n" + "\n\n".join(bloques_contexto_afirm) if bloques_contexto_afirm else "")
     )
 
     instruccion_sistema = (
         "Eres el 'Oráculo del Irminsul', un asistente experto en el lore de Genshin Impact que ayuda a una autora "
-        "a escribir su libro enciclopedia de lore en español.\n"
+        "a escribir su libro enciclopédico de lore en español.\n"
         "REGLAS ESTRICTAS:\n"
         "1. Responde SIEMPRE en español con estilo enciclopédico, claro, bien estructurado y riguroso.\n"
         "2. Basa tu respuesta con máxima prioridad en los Textos Canon del Juego [TJ1..TJn], seguidos de las Fuentes de la Wiki [F1..Fn] y Relaciones [R1..Rn].\n"
-        "3. Cita explícitamente en el texto de dónde sale cada dato usando corchetes, por ejemplo: "
-        "[Libro: The Fox in the Dandelion Sea (TJ1)], [Capitano - The Cataclysm (F1)] o [Relación Capitano ➔ Mavuika (R2)].\n"
-        "4. Utiliza la terminología oficial en español de Genshin Impact (Los Once de los Fatui, Reina Menor Kusanali, "
+        "3. Si usas Afirmaciones Externas [A1..An], DEBES distinguir explícitamente si son 'inferido' o 'teoría' y nunca presentarlas como canon confirmado.\n"
+        "4. Cita explícitamente en el texto de dónde sale cada dato usando corchetes, por ejemplo: "
+        "[Libro: The Fox in the Dandelion Sea (TJ1)], [Capitano - The Cataclysm (F1)], [Relación Capitano ➔ Mavuika (R2)] o [Teoría (A1)].\n"
+        "5. Utiliza la terminología oficial en español de Genshin Impact (Los Once de los Fatui, Reina Menor Kusanali, "
         "Principios Celestiales, Siete Soberanos, Cataclismo, Irminsul, Líneas Ley, Reino de la Noche)."
     )
 
@@ -1173,14 +1233,75 @@ METADATOS_ERAS_TEYVAT = {
 }
 
 
+def clasificar_certeza_wiki(texto: str) -> str:
+    """Detecta expresiones de incertidumbre o especulación en textos de la Wiki para separar canon firme de inferencias."""
+    t = (texto or "").lower()
+    marcadores_teoria = ("it is speculated", "theorized", "speculation", "rumor", "rumored")
+    marcadores_inferencia = (
+        "presumably", "possibly", "probably", "implied", "likely", "around ",
+        "approximately", "circa", "sometime ", "unclear", "unknown", "believed to", "may have"
+    )
+    if any(k in t for k in marcadores_teoria):
+        return "teoria"
+    if any(k in t for k in marcadores_inferencia):
+        return "inferido"
+    return "canon"
+
+
+def _resumir_titulo_hecho(texto: str, max_len: int = 64) -> str:
+    """Extrae un titular corto (primera frase o corte limpio) para el nodo visual del eje cronológico."""
+    t = re.sub(r"\s+", " ", (texto or "")).strip()
+    punto = t.find(". ")
+    if 18 <= punto <= max_len:
+        return t[:punto]
+    return t[:max_len].rstrip(" ,;:") + ("..." if len(t) > max_len else "")
+
+
+def _fusionar_hitos_afirmaciones(eras_base: list[dict]) -> list[dict]:
+    """Combina los hitos base cacheados de la Wiki con las afirmaciones externas cronológicas actuales de Neo4j."""
+    hitos_ext = []
+    try:
+        hitos_ext = procedencia.listar_hitos_cronologicos(driver)
+    except Exception:
+        hitos_ext = []
+
+    por_era: dict[str, list[dict]] = {}
+    for a in hitos_ext:
+        if a.get("estado") == "refutada":
+            continue
+        eid = a.get("era_id") or ""
+        por_era.setdefault(eid, []).append({
+            "id": f"ext_{a['id']}",
+            "afirmacion_id": a["id"],
+            "region": a.get("fecha_lore") or "Fuente externa",
+            "nivel": 1,
+            "titulo_corto": _resumir_titulo_hecho(a.get("texto", "")),
+            "texto": a.get("texto", ""),
+            "entidades": [a["entidad_id"]] if a.get("entidad_id") else [],
+            "ref_titulo": a.get("fuente_titulo") or a.get("tipo_fuente") or "Fuente externa",
+            "ref_url": a.get("fuente_url") or "",
+            "certeza": a.get("certeza") or "teoria",
+            "es_externo": True,
+            "fecha_lore": a.get("fecha_lore") or "",
+            "nota": a.get("nota") or "",
+            "version_juego": a.get("version_juego") or "",
+        })
+
+    resultado = []
+    for era in eras_base:
+        copia = {**era, "hechos": list(era["hechos"]) + por_era.get(era["id"], [])}
+        resultado.append(copia)
+    return resultado
+
+
 @app.get("/api/timeline_teyvat")
 def obtener_linea_temporal_teyvat():
     """
     Construye la Línea del Tiempo Completa de Teyvat combinando la página oficial 'Timeline'
-    y las 8 subpáginas 'Nación/History' de la Wiki junto con las entidades de la base de datos.
+    y las 8 subpáginas 'Nación/History' de la Wiki junto con los hitos externos de procedencia.
     """
     if CACHE_TIMELINE_TEYVAT:
-        return {"eras": CACHE_TIMELINE_TEYVAT}
+        return {"eras": _fusionar_hitos_afirmaciones(CACHE_TIMELINE_TEYVAT), "edicion_habilitada": bool(ADMIN_TOKEN)}
 
     titulos_lote = (
         "Timeline|Mondstadt/History|Liyue/History|Inazuma/History|"
@@ -1311,10 +1432,13 @@ def obtener_linea_temporal_teyvat():
                     "id": f"era_{meta['orden']}_{len(hechos_era)}",
                     "region": nombre_region,
                     "nivel": min(nivel_sub, 3),
+                    "titulo_corto": _resumir_titulo_hecho(texto_limpio),
                     "texto": texto_limpio,
                     "entidades": entidades_linea[:8],
                     "ref_titulo": ref_titulo[:100],
                     "ref_url": ref_url or f"{WIKI_BASE_URL}Timeline",
+                    "certeza": clasificar_certeza_wiki(texto_limpio),
+                    "es_externo": False,
                 })
 
             if any(h["region"] == nombre_region for h in hechos_era) and nombre_region not in regiones_presentes:
@@ -1339,7 +1463,7 @@ def obtener_linea_temporal_teyvat():
 
     eras_resultado.sort(key=lambda x: x["orden"])
     CACHE_TIMELINE_TEYVAT.extend(eras_resultado)
-    return {"eras": CACHE_TIMELINE_TEYVAT}
+    return {"eras": _fusionar_hitos_afirmaciones(CACHE_TIMELINE_TEYVAT), "edicion_habilitada": bool(ADMIN_TOKEN)}
 
 
 @app.get("/api/nodo/{entidad_id:path}")
@@ -1903,24 +2027,33 @@ def interfaz_web():
             </div>
         </div>
 
-        <!-- VISTA ALTERNATIVA: LÍNEA DEL TIEMPO GENERAL DE TEYVAT -->
-        <div id="teyvatTimelineViewport" class="hidden flex-1 min-h-0 gi-constellation-canvas flex flex-col md:flex-row overflow-hidden relative">
-            <!-- Columna izquierda: Las 12 Grandes Épocas de Teyvat -->
-            <div class="w-full md:w-72 lg:w-80 bg-[#161b28]/95 border-b md:border-b-0 md:border-r border-gi-gold/35 flex flex-col shrink-0 z-10">
-                <div class="px-4 py-3 border-b border-gi-gold/30 flex items-center justify-between">
-                    <div class="flex items-center gap-2">
-                        <span class="text-gi-goldBright text-sm">⏳</span>
-                        <span class="font-serif font-bold text-xs uppercase tracking-wider text-gi-goldBright">Épocas de Teyvat</span>
+        <!-- VISTA ALTERNATIVA: LÍNEA DEL TIEMPO INTERACTIVA DE TEYVAT -->
+        <div id="teyvatTimelineViewport" class="hidden flex-1 min-h-0 gi-constellation-canvas flex flex-col overflow-hidden relative">
+            <!-- Barra Superior: Regla Cronológica Horizontal de las 12 Eras de Teyvat -->
+            <div class="bg-[#161b28]/95 border-b border-gi-gold/40 px-4 py-2.5 shrink-0 z-20 space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div class="flex items-center gap-2.5">
+                        <span class="text-gi-goldBright text-base">⏳</span>
+                        <div>
+                            <div class="font-serif font-bold text-xs md:text-sm text-gi-goldBright tracking-wide">Crónica Visual de Teyvat</div>
+                            <div class="text-[10px] text-[#9aa3b8]">Haz clic en cualquier época o hito del eje para ver detalles y certeza</div>
+                        </div>
                     </div>
-                    <button onclick="alternarModoPrincipal('grafo')" class="px-2.5 py-1 rounded-full bg-[#232b3e] hover:bg-gi-gold/25 border border-gi-gold/40 text-[10px] text-gi-cream transition flex items-center gap-1">
-                        <i class="fa-solid fa-arrow-left text-[9px] text-gi-gold"></i> Volver al Grafo
-                    </button>
+                    <div class="flex flex-wrap items-center gap-1.5">
+                        <button onclick="alternarFiltroCerteza('canon')" id="btnFiltroCanon" class="px-2.5 py-1 rounded-full text-[11px] font-bold border border-emerald-400/50 bg-emerald-500/20 text-emerald-200 transition">✓ Canon</button>
+                        <button onclick="alternarFiltroCerteza('inferido')" id="btnFiltroInferido" class="px-2.5 py-1 rounded-full text-[11px] font-bold border border-amber-400/50 bg-amber-500/20 text-amber-200 transition">✓ Inferido</button>
+                        <button onclick="alternarFiltroCerteza('teoria')" id="btnFiltroTeoria" class="px-2.5 py-1 rounded-full text-[11px] font-bold border border-fuchsia-400/50 bg-fuchsia-500/20 text-fuchsia-200 transition">✓ Teorías</button>
+                        <button onclick="alternarModoPrincipal('grafo')" class="ml-1 px-3 py-1 rounded-full bg-[#232b3e] hover:bg-gi-gold/25 border border-gi-gold/40 text-[11px] text-gi-cream transition flex items-center gap-1">
+                            <i class="fa-solid fa-arrow-left text-[9px] text-gi-gold"></i> Volver al Grafo
+                        </button>
+                    </div>
                 </div>
-                <div id="listaErasTeyvatSidebar" class="p-3 overflow-y-auto space-y-1.5 flex-1 min-h-0"></div>
+                <!-- Eje horizontal scrollable de las 12 épocas -->
+                <div id="listaErasTeyvatSidebar" class="flex items-center gap-2 overflow-x-auto pb-1 pt-0.5"></div>
             </div>
 
-            <!-- Área central: Entidades protagonistas y Hechos Históricos de la Época seleccionada -->
-            <div id="detalleEraTeyvatContent" class="flex-1 min-h-0 overflow-y-auto p-5 space-y-5 z-10">
+            <!-- Lienzo Central: Eje visual de hitos clicables + Panel de detalle al pulsar -->
+            <div id="detalleEraTeyvatContent" class="flex-1 min-h-0 flex flex-col overflow-hidden z-10">
                 <div class="text-center py-16 text-gi-cream/70 space-y-2">
                     <i class="fa-solid fa-spinner fa-spin text-2xl text-gi-goldBright"></i>
                     <p class="text-sm">Cargando la Crónica Histórica de Teyvat...</p>
@@ -2032,6 +2165,9 @@ def interfaz_web():
         let datosTimelineTeyvat = [];
         let eraTeyvatActivaIdx = 0;
         let regionTeyvatFiltro = "TODAS";
+        let certezaTeyvatFiltro = new Set(["canon", "inferido", "teoria"]);
+        let hechoTeyvatSeleccionadoId = null;
+        let edicionTimelineHabilitada = false;
         let historialChat = [];
 
         const CATALOGO_ERAS = [
@@ -2672,8 +2808,8 @@ def interfaz_web():
             }
         }
 
-        async function cargarLineaTemporalTeyvat() {
-            if (datosTimelineTeyvat.length > 0) {
+        async function cargarLineaTemporalTeyvat(forzarRecarga = false) {
+            if (datosTimelineTeyvat.length > 0 && !forzarRecarga) {
                 renderizarSidebarErasTeyvat();
                 renderizarDetalleEraTeyvat();
                 return;
@@ -2687,8 +2823,12 @@ def interfaz_web():
                     return;
                 }
                 datosTimelineTeyvat = data.eras || [];
-                eraTeyvatActivaIdx = 0;
-                regionTeyvatFiltro = "TODAS";
+                edicionTimelineHabilitada = Boolean(data.edicion_habilitada);
+                if (eraTeyvatActivaIdx >= datosTimelineTeyvat.length) eraTeyvatActivaIdx = 0;
+                if (!forzarRecarga) {
+                    regionTeyvatFiltro = "TODAS";
+                    hechoTeyvatSeleccionadoId = null;
+                }
                 renderizarSidebarErasTeyvat();
                 renderizarDetalleEraTeyvat();
             } catch (e) {
@@ -2696,17 +2836,44 @@ def interfaz_web():
             }
         }
 
+        function alternarFiltroCerteza(tipo) {
+            if (certezaTeyvatFiltro.has(tipo)) {
+                if (certezaTeyvatFiltro.size === 1) return; // evitar dejar todos vacíos por accidente
+                certezaTeyvatFiltro.delete(tipo);
+            } else {
+                certezaTeyvatFiltro.add(tipo);
+            }
+            const mapaBtn = {
+                canon: { id: 'btnFiltroCanon', txt: 'Canon', cls: 'border-emerald-400/50 bg-emerald-500/20 text-emerald-200' },
+                inferido: { id: 'btnFiltroInferido', txt: 'Inferido', cls: 'border-amber-400/50 bg-amber-500/20 text-amber-200' },
+                teoria: { id: 'btnFiltroTeoria', txt: 'Teorías', cls: 'border-fuchsia-400/50 bg-fuchsia-500/20 text-fuchsia-200' }
+            };
+            Object.entries(mapaBtn).forEach(([k, cfg]) => {
+                const b = document.getElementById(cfg.id);
+                if (!b) return;
+                const on = certezaTeyvatFiltro.has(k);
+                b.textContent = (on ? '✓ ' : '○ ') + cfg.txt;
+                b.className = `px-2.5 py-1 rounded-full text-[11px] font-bold border transition ${on ? cfg.cls : 'border-gi-gold/20 bg-[#181d2b] text-[#7c8599] opacity-60'}`;
+            });
+            renderizarDetalleEraTeyvat();
+        }
+
         function seleccionarEraTeyvat(idx) {
             eraTeyvatActivaIdx = idx;
             regionTeyvatFiltro = "TODAS";
+            hechoTeyvatSeleccionadoId = null;
             renderizarSidebarErasTeyvat();
             renderizarDetalleEraTeyvat();
-            const cont = document.getElementById('detalleEraTeyvatContent');
-            if (cont) cont.scrollTop = 0;
         }
 
         function seleccionarRegionEraTeyvat(region) {
             regionTeyvatFiltro = region;
+            hechoTeyvatSeleccionadoId = null;
+            renderizarDetalleEraTeyvat();
+        }
+
+        function seleccionarHechoTeyvat(hechoId) {
+            hechoTeyvatSeleccionadoId = hechoId;
             renderizarDetalleEraTeyvat();
         }
 
@@ -2721,16 +2888,15 @@ def interfaz_web():
 
             sidebar.innerHTML = datosTimelineTeyvat.map((era, idx) => {
                 const activo = (idx === eraTeyvatActivaIdx);
+                const cCanon = era.hechos.filter(h => (h.certeza || 'canon') === 'canon').length;
+                const cSup = era.hechos.length - cCanon;
                 return `
-                    <button onclick="seleccionarEraTeyvat(${idx})" class="w-full text-left p-2.5 rounded-xl border transition flex items-start gap-2.5 ${activo ? 'bg-gi-gold text-[#161b26] border-gi-goldBright shadow-[0_0_15px_rgba(240,220,175,0.4)] font-bold' : 'bg-[#1b2234]/85 text-gi-cream border-gi-gold/25 hover:border-gi-gold/60'}">
-                        <span class="text-xs mt-0.5 ${activo ? 'text-[#161b26]' : 'text-gi-goldBright'}">✦</span>
-                        <div class="min-w-0 flex-1">
-                            <div class="font-serif text-xs leading-snug">${escaparHtml(era.titulo_es)}</div>
-                            <div class="text-[10px] mt-0.5 ${activo ? 'text-[#2c3345]' : 'text-[#9aa3b8]'} flex items-center justify-between">
-                                <span>${era.hechos.length} hechos</span>
-                                <span>${era.entidades_destacadas.length} entidades</span>
-                            </div>
+                    <button onclick="seleccionarEraTeyvat(${idx})" class="shrink-0 min-w-[165px] max-w-[210px] text-left px-3 py-2 rounded-xl border transition relative ${activo ? 'bg-gi-gold text-[#161b26] border-gi-goldBright shadow-[0_0_16px_rgba(240,220,175,0.45)] font-bold' : 'bg-[#1b2234]/90 text-gi-cream border-gi-gold/25 hover:border-gi-gold/70'}">
+                        <div class="flex items-center justify-between gap-1 text-[10px] ${activo ? 'text-[#2c3345]' : 'text-gi-gold'}">
+                            <span class="font-bold">ÉPOCA ${era.orden}</span>
+                            <span>${cCanon}✓${cSup ? ' · ' + cSup + '~' : ''}</span>
                         </div>
+                        <div class="font-serif text-[11.5px] leading-tight truncate mt-0.5">${escaparHtml(era.titulo_es.replace(/^[IVXLCDM]+\.\s*/, ''))}</div>
                     </button>
                 `;
             }).join('');
@@ -2812,40 +2978,25 @@ def interfaz_web():
 
             // Píldoras de regiones de esta época
             let pillsRegiones = `
-                <button onclick="seleccionarRegionEraTeyvat('TODAS')" class="px-3 py-1 rounded-full text-xs font-semibold transition ${regionTeyvatFiltro === 'TODAS' ? 'bg-gi-gold text-[#161b26] font-bold shadow' : 'bg-[#181d2b] text-gi-cream/85 border border-gi-gold/30 hover:border-gi-gold'}">
-                    ✦ Todas las Regiones (${era.hechos.length})
+                <button onclick="seleccionarRegionEraTeyvat('TODAS')" class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold transition ${regionTeyvatFiltro === 'TODAS' ? 'bg-gi-gold text-[#161b26] font-bold shadow' : 'bg-[#181d2b] text-gi-cream/85 border border-gi-gold/30 hover:border-gi-gold'}">
+                    ✦ Todas (${era.hechos.length})
                 </button>
             `;
             (era.regiones || []).forEach(reg => {
                 const cnt = era.hechos.filter(h => h.region === reg).length;
                 const act = (regionTeyvatFiltro === reg);
                 pillsRegiones += `
-                    <button onclick="seleccionarRegionEraTeyvat('${escaparComillas(reg)}')" class="px-3 py-1 rounded-full text-xs font-medium transition ${act ? 'bg-gi-gold text-[#161b26] font-bold shadow' : 'bg-[#181d2b] text-gi-cream/85 border border-gi-gold/30 hover:border-gi-gold'}">
+                    <button onclick="seleccionarRegionEraTeyvat('${escaparComillas(reg)}')" class="px-2.5 py-0.5 rounded-full text-[11px] font-medium transition ${act ? 'bg-gi-gold text-[#161b26] font-bold shadow' : 'bg-[#181d2b] text-gi-cream/85 border border-gi-gold/30 hover:border-gi-gold'}">
                         ${escaparHtml(reg)} (${cnt})
                     </button>
                 `;
             });
 
-            // Galería de Entidades Protagonistas de esta época
-            const htmlEntidadesEra = (era.entidades_destacadas && era.entidades_destacadas.length)
-                ? era.entidades_destacadas.map(e => `
-                    <div class="flex items-center gap-2 px-2.5 py-1.5 rounded-full bg-[#181d2b] hover:bg-[#242c40] border border-gi-gold/35 transition group">
-                        <div class="flex items-center gap-2 cursor-pointer" onclick="mostrarFichaNodo('${escaparComillas(e.id)}')" title="Leer enciclopedia de ${escaparHtml(e.id)} a la derecha">
-                            <img src="${urlAvatar(e.id)}" class="w-6 h-6 rounded-full object-cover border border-gi-gold shrink-0" alt="">
-                            <span class="text-xs font-semibold text-gi-cream group-hover:text-gi-goldBright">${escaparHtml(e.id)}</span>
-                            <span class="text-[10px] px-1.5 py-0.2 rounded-full bg-gi-gold/20 text-gi-goldBright">${e.menciones}</span>
-                        </div>
-                        <button onclick="abrirEntidadEnGrafoDesdeTimeline('${escaparComillas(e.id)}')" class="text-[10px] text-[#9fd6e3] hover:underline ml-1" title="Abrir en el Grafo de Constelación">
-                            <i class="fa-solid fa-diagram-project"></i>
-                        </button>
-                    </div>
-                `).join('')
-                : '';
-
-            // Hechos históricos filtrados
+            // Hechos filtrados por región, texto y nivel de certeza (canon / inferido / teoria)
             const hechosFiltrados = era.hechos
-                .map((h, idxOriginal) => ({ ...h, idxOriginal }))
+                .map((h, idxOriginal) => ({ ...h, idxOriginal, certeza: h.certeza || 'canon' }))
                 .filter(h => regionTeyvatFiltro === 'TODAS' || h.region === regionTeyvatFiltro)
+                .filter(h => certezaTeyvatFiltro.has(h.certeza))
                 .filter(h => {
                     if (!filtroTxt) return true;
                     const t = ((h.mostrar_es && h.texto_es) ? h.texto_es : h.texto).toLowerCase();
@@ -2853,96 +3004,168 @@ def interfaz_web():
                     return t.includes(filtroTxt) || ents.includes(filtroTxt) || h.region.toLowerCase().includes(filtroTxt);
                 });
 
-            const htmlHechos = hechosFiltrados.map(h => {
-                const enEs = Boolean(h.mostrar_es && h.texto_es);
-                const txtMostrar = enEs ? h.texto_es : h.texto;
-                const etiqBtn = h.texto_es ? (enEs ? '🌐 Ver EN' : '🌐 Ver ES') : '🌐 Traducir';
-                const margenSub = h.nivel === 2 ? 'ml-5' : (h.nivel >= 3 ? 'ml-10' : '');
+            if (hechosFiltrados.length && !hechosFiltrados.some(h => h.id === hechoTeyvatSeleccionadoId)) {
+                hechoTeyvatSeleccionadoId = hechosFiltrados[0].id;
+            }
+            const hechoActivo = hechosFiltrados.find(h => h.id === hechoTeyvatSeleccionadoId) || null;
 
-                const pillsEnts = (h.entidades && h.entidades.length)
+            const ESTILOS_NODO = {
+                canon: { borde: 'border-emerald-400/70', punto: 'bg-emerald-400 border-emerald-200', badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-400/40', txt: 'Canon', linea: 'border-solid' },
+                inferido: { borde: 'border-amber-400/70', punto: 'bg-amber-400 border-amber-200', badge: 'bg-amber-500/20 text-amber-300 border-amber-400/40', txt: 'Inferido', linea: 'border-dashed' },
+                teoria: { borde: 'border-fuchsia-400/70', punto: 'bg-fuchsia-400 border-fuchsia-200', badge: 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-400/40', txt: 'Teoría', linea: 'border-dotted' }
+            };
+
+            // Nodos visuales interactivos sobre el eje horizontal de la época
+            const htmlNodosEje = hechosFiltrados.map((h, pos) => {
+                const st = ESTILOS_NODO[h.certeza] || ESTILOS_NODO.canon;
+                const activo = (hechoActivo && h.id === hechoActivo.id);
+                const tituloCorto = h.mostrar_es && h.texto_es
+                    ? (h.texto_es.slice(0, 62) + (h.texto_es.length > 62 ? '...' : ''))
+                    : (h.titulo_corto || h.texto.slice(0, 62));
+                const arriba = (pos % 2 === 0);
+                const entPrincipal = (h.entidades && h.entidades[0]) || '';
+
+                return `
+                <div class="shrink-0 w-56 flex flex-col items-center relative group cursor-pointer" onclick="seleccionarHechoTeyvat('${escaparComillas(h.id)}')">
+                    <div class="w-full p-2.5 rounded-xl bg-[#181d2b]/95 ${st.linea} border-2 ${activo ? 'border-gi-goldBright ring-2 ring-gi-gold/40 bg-[#232b3e] scale-[1.02]' : st.borde + ' hover:border-gi-gold'} transition shadow-lg space-y-1.5 ${arriba ? 'mb-3' : 'mt-3 order-3'}">
+                        <div class="flex items-center justify-between gap-1 text-[9.5px]">
+                            <span class="px-1.5 py-0.5 rounded-full border font-bold ${st.badge}">${st.txt}</span>
+                            <span class="text-[#9fd6e3] truncate font-medium">${escaparHtml(h.region)}</span>
+                        </div>
+                        <div class="text-[11px] font-semibold text-gi-cream leading-snug line-clamp-3">${escaparHtml(tituloCorto)}</div>
+                        ${entPrincipal ? `
+                        <div class="flex items-center gap-1.5 pt-1 border-t border-gi-gold/15">
+                            <img src="${urlAvatar(entPrincipal)}" class="w-4 h-4 rounded-full object-cover border border-gi-gold/60 shrink-0" alt="">
+                            <span class="text-[10px] text-gi-goldBright truncate">${escaparHtml(entPrincipal)}${h.entidades.length > 1 ? ' +' + (h.entidades.length - 1) : ''}</span>
+                        </div>` : ''}
+                    </div>
+                    <div class="w-0.5 h-3 bg-gi-gold/60 ${arriba ? '' : 'order-2'}"></div>
+                    <div class="w-4 h-4 rounded-full border-2 ${activo ? 'bg-gi-goldBright border-white scale-125 shadow-[0_0_12px_rgba(240,220,175,0.9)]' : st.punto} transition z-10 ${arriba ? '' : 'order-1'}"></div>
+                </div>`;
+            }).join('');
+
+            // Panel inferior de detalle al hacer clic en un nodo del eje
+            let htmlDetalleSeleccionado = '<div class="p-6 text-center text-xs text-[#9aa3b8] italic">Haz clic sobre cualquier nodo en la línea temporal superior para inspeccionar su texto completo, certeza, fuentes y entidades vinculadas.</div>';
+            if (hechoActivo) {
+                const st = ESTILOS_NODO[hechoActivo.certeza] || ESTILOS_NODO.canon;
+                const enEs = Boolean(hechoActivo.mostrar_es && hechoActivo.texto_es);
+                const txtMostrar = enEs ? hechoActivo.texto_es : hechoActivo.texto;
+                const etiqBtn = hechoActivo.texto_es ? (enEs ? '🌐 Ver EN' : '🌐 Ver ES') : '🌐 Traducir';
+                const pillsEnts = (hechoActivo.entidades && hechoActivo.entidades.length)
                     ? `<div class="flex flex-wrap items-center gap-1.5 pt-2">
-                        ${h.entidades.map(ent => `
-                            <button onclick="mostrarFichaNodo('${escaparComillas(ent)}')" class="px-2 py-0.5 rounded-full bg-[#3b4255]/15 hover:bg-[#3b4255]/30 border border-[#8c6d32]/40 text-[10px] font-semibold text-[#2c3345] flex items-center gap-1 transition">
-                                <span class="text-[#8c6d32]">✦</span> ${escaparHtml(ent)}
+                        ${hechoActivo.entidades.map(ent => `
+                            <button onclick="mostrarFichaNodo('${escaparComillas(ent)}')" class="px-2.5 py-1 rounded-full bg-[#181d2b] hover:bg-[#252e45] border border-gi-gold/40 text-[11px] font-semibold text-gi-cream flex items-center gap-1.5 transition">
+                                <img src="${urlAvatar(ent)}" class="w-4 h-4 rounded-full object-cover border border-gi-gold" alt="">
+                                <span>${escaparHtml(ent)}</span>
                             </button>
                         `).join('')}
                        </div>`
                     : '';
 
-                return `
-                    <div class="relative pl-6 pb-3 ${margenSub}">
-                        <div class="absolute -left-[9px] top-2 w-4 h-4 rounded-full bg-[#161b26] border-2 border-gi-gold flex items-center justify-center text-[8px] text-gi-goldBright shadow-[0_0_8px_rgba(240,220,175,0.6)]">✦</div>
-                        <div class="gi-parchment-box rounded-xl overflow-hidden">
-                            <div class="px-3.5 py-2 bg-[#e2d8c3] border-b border-[#c8b082] flex flex-wrap items-center justify-between gap-2">
-                                <div class="flex items-center gap-2">
-                                    <span class="px-2.5 py-0.5 rounded-full bg-[#3b4255] text-[#f0dcaf] text-[10px] font-bold">
-                                        📍 ${escaparHtml(h.region)}
-                                    </span>
-                                    ${h.ref_url ? `<a href="${h.ref_url}" target="_blank" rel="noopener noreferrer" class="text-[11px] font-semibold text-[#5a4622] hover:underline flex items-center gap-1"><i class="fa-solid fa-book-bookmark text-[10px]"></i> ${escaparHtml(h.ref_titulo)} ↗</a>` : ''}
-                                </div>
-                                <div class="flex items-center gap-1.5">
-                                    <button onclick="traducirHechoTeyvat(${eraTeyvatActivaIdx}, ${h.idxOriginal}, this)" class="px-2.5 py-0.5 rounded-full bg-[#3b4255] hover:bg-[#252b3b] border border-[#d3bc8e] text-[10px] font-semibold text-[#f4efe6] transition">
-                                        ${etiqBtn}
-                                    </button>
-                                    <button onclick="copiarTextoAlPortapapeles(datosTimelineTeyvat[${eraTeyvatActivaIdx}].hechos[${h.idxOriginal}].mostrar_es ? datosTimelineTeyvat[${eraTeyvatActivaIdx}].hechos[${h.idxOriginal}].texto_es : datosTimelineTeyvat[${eraTeyvatActivaIdx}].hechos[${h.idxOriginal}].texto, this)" class="px-2.5 py-0.5 rounded-full bg-[#f5f0e6] hover:bg-white border border-[#b59d6e] text-[10px] font-semibold text-[#3b4255] transition">
-                                        <i class="fa-regular fa-copy"></i> Copiar
-                                    </button>
-                                </div>
+                htmlDetalleSeleccionado = `
+                    <div class="gi-parchment-box rounded-xl overflow-hidden shadow-lg">
+                        <div class="px-4 py-2.5 bg-[#e2d8c3] border-b border-[#c8b082] flex flex-wrap items-center justify-between gap-2">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="px-2.5 py-0.5 rounded-full bg-[#1b202e] text-gi-goldBright text-[10px] font-bold">${escaparHtml(st.txt.toUpperCase())}</span>
+                                <span class="px-2.5 py-0.5 rounded-full bg-[#3b4255] text-[#f0dcaf] text-[10px] font-bold">📍 ${escaparHtml(hechoActivo.region)}</span>
+                                ${hechoActivo.version_juego ? `<span class="text-[10px] font-bold text-[#5a4622]">v${escaparHtml(hechoActivo.version_juego)}</span>` : ''}
+                                ${hechoActivo.ref_url
+                                    ? `<a href="${escaparHtml(urlSegura(hechoActivo.ref_url))}" target="_blank" rel="noopener noreferrer" class="text-[11px] font-semibold text-[#5a4622] hover:underline flex items-center gap-1"><i class="fa-solid fa-book-bookmark text-[10px]"></i> ${escaparHtml(hechoActivo.ref_titulo)} ↗</a>`
+                                    : `<span class="text-[11px] font-semibold text-[#5a4622]">${escaparHtml(hechoActivo.ref_titulo || 'Fuente')}</span>`}
                             </div>
-                            <div class="p-3.5 text-xs md:text-[13.5px] leading-relaxed font-medium text-[#2c3345]">
-                                <div>${escaparHtml(txtMostrar)}</div>
-                                ${pillsEnts}
+                            <div class="flex items-center gap-1.5">
+                                <button onclick="traducirHechoTeyvat(${eraTeyvatActivaIdx}, ${hechoActivo.idxOriginal}, this)" class="px-2.5 py-0.5 rounded-full bg-[#3b4255] hover:bg-[#252b3b] border border-[#d3bc8e] text-[10px] font-semibold text-[#f4efe6] transition">${etiqBtn}</button>
+                                <button onclick="copiarTextoAlPortapapeles(datosTimelineTeyvat[${eraTeyvatActivaIdx}].hechos[${hechoActivo.idxOriginal}].mostrar_es ? datosTimelineTeyvat[${eraTeyvatActivaIdx}].hechos[${hechoActivo.idxOriginal}].texto_es : datosTimelineTeyvat[${eraTeyvatActivaIdx}].hechos[${hechoActivo.idxOriginal}].texto, this)" class="px-2.5 py-0.5 rounded-full bg-[#f5f0e6] hover:bg-white border border-[#b59d6e] text-[10px] font-semibold text-[#3b4255] transition"><i class="fa-regular fa-copy"></i> Copiar</button>
+                                ${hechoActivo.es_externo && edicionTimelineHabilitada ? `<button onclick="borrarHitoCronologico('${escaparComillas(hechoActivo.afirmacion_id)}')" class="px-2.5 py-0.5 rounded-full bg-[#6d222e] text-white text-[10px] font-semibold">Borrar hito</button>` : ''}
                             </div>
                         </div>
+                        <div class="p-4 text-xs md:text-sm leading-relaxed font-medium text-[#2c3345] space-y-2">
+                            <div>${escaparHtml(txtMostrar)}</div>
+                            ${hechoActivo.nota ? `<div class="text-xs italic text-[#5a4622] border-l-2 border-[#8c6d32] pl-2.5">${escaparHtml(hechoActivo.nota)}</div>` : ''}
+                            ${pillsEnts}
+                        </div>
+                    </div>`;
+            }
+
+            const formHito = edicionTimelineHabilitada ? `
+                <details class="rounded-xl border border-gi-gold/35 bg-[#181d2b]/95 overflow-hidden">
+                    <summary class="px-3.5 py-1.5 cursor-pointer select-none list-none text-[11px] font-bold text-gi-goldBright hover:bg-[#20273b]">+ Situar nuevo hito o teoría en esta época</summary>
+                    <div class="p-3 border-t border-gi-gold/20 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                        <input id="tlEntidad" placeholder="Entidad vinculada exacta (ej. Paimon, Zhongli)" class="bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-gi-cream">
+                        <input id="tlFecha" placeholder="Momento / Región (ej. Hace ~2000 años · Liyue)" class="bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-gi-cream">
+                        <select id="tlCerteza" class="bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-gi-cream">
+                            <option value="canon">Canon (confirmado)</option>
+                            <option value="inferido">Inferido (aproximado/deducido)</option>
+                            <option value="teoria" selected>Teoría / Hipótesis</option>
+                        </select>
+                        <input id="tlFuenteUrl" placeholder="URL fuente (opcional https://...)" class="bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-gi-cream">
+                        <textarea id="tlTexto" rows="2" placeholder="Descripción del suceso o teoría en esta época..." class="md:col-span-2 bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-gi-cream"></textarea>
+                        <button onclick="guardarHitoCronologico('${escaparComillas(era.id)}')" class="gi-btn-cream px-3 py-1 text-[11px] w-fit">Guardar en Línea Temporal</button>
                     </div>
-                `;
-            }).join('');
+                </details>` : '';
 
             cont.innerHTML = `
-                <!-- Cabecera de la Época de Teyvat -->
-                <div class="gi-card-inner p-5 rounded-2xl space-y-3 border border-gi-gold/50">
-                    <div class="flex flex-wrap items-start justify-between gap-3">
+                <!-- Cabecera compacta + Filtros de la Época -->
+                <div class="p-3.5 bg-[#151a27]/95 border-b border-gi-gold/30 space-y-2.5 shrink-0">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
                         <div>
-                            <div class="text-[11px] font-serif uppercase tracking-widest text-gi-gold">CRÓNICA HISTÓRICA DE TEYVAT · ÉPOCA ${era.orden} DE ${datosTimelineTeyvat.length}</div>
-                            <h2 class="font-serif text-xl md:text-2xl font-bold text-gi-goldBright mt-0.5">${escaparHtml(era.titulo_es)}</h2>
-                            <p class="text-xs text-gi-cream/80 mt-1">${escaparHtml(era.subtitulo)}</p>
+                            <div class="text-[10px] font-serif uppercase tracking-widest text-gi-gold">ÉPOCA ${era.orden} DE ${datosTimelineTeyvat.length} · ${hechosFiltrados.length} HITOS VISIBLES</div>
+                            <h2 class="font-serif text-base md:text-lg font-bold text-gi-goldBright">${escaparHtml(era.titulo_es)}</h2>
                         </div>
                         <div class="flex items-center gap-2 shrink-0">
-                            <button onclick="traducirTodaEraTeyvat(${eraTeyvatActivaIdx}, this)" class="gi-btn-cream px-3.5 py-1.5 text-xs flex items-center gap-1.5">
-                                <i class="fa-solid fa-language text-[#3b4255]"></i>
-                                <span>Traducir Época con Gemini</span>
-                            </button>
-                            <a href="${era.url_wiki}" target="_blank" rel="noopener noreferrer" class="gi-btn-dark px-3 py-1.5 text-xs flex items-center gap-1.5">
-                                <span>Wiki Timeline</span>
-                                <i class="fa-solid fa-arrow-up-right-from-square text-[9px] text-gi-gold"></i>
-                            </a>
+                            <div class="relative flex items-center">
+                                <i class="fa-solid fa-magnifying-glass absolute left-2.5 text-gi-gold/70 text-[10px]"></i>
+                                <input type="text" id="filtroTextoEraTeyvat" value="${escaparHtml(filtroTxt)}" oninput="renderizarDetalleEraTeyvat()" placeholder="Filtrar en esta época..." class="w-44 md:w-56 bg-[#111520] border border-gi-gold/30 rounded-full pl-7 pr-3 py-1 text-[11px] text-gi-cream placeholder-[#7c8599] focus:outline-none focus:border-gi-goldBright">
+                            </div>
+                            <button onclick="traducirTodaEraTeyvat(${eraTeyvatActivaIdx}, this)" class="gi-btn-cream px-3 py-1 text-[11px] flex items-center gap-1"><i class="fa-solid fa-language text-[#3b4255]"></i><span>Traducir Época</span></button>
+                            <a href="${era.url_wiki}" target="_blank" rel="noopener noreferrer" class="gi-btn-dark px-2.5 py-1 text-[11px]">Wiki ↗</a>
                         </div>
                     </div>
-
-                    <!-- Entidades Protagonistas de esta Época -->
-                    <div class="pt-2 border-t border-gi-gold/25 space-y-2">
-                        <div class="text-[11px] font-serif font-bold uppercase tracking-wider text-gi-gold flex items-center gap-1.5">
-                            <span>✦</span>
-                            <span>Entidades Protagonistas de esta Época (clic para abrir su enciclopedia a la derecha):</span>
-                        </div>
-                        <div class="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto pr-1">${htmlEntidadesEra}</div>
-                    </div>
-                </div>
-
-                <!-- Filtros de Región dentro de esta Época -->
-                <div class="gi-card-inner p-3.5 rounded-xl space-y-2.5">
                     <div class="flex flex-wrap items-center gap-1.5">${pillsRegiones}</div>
-                    <div class="relative flex items-center">
-                        <i class="fa-solid fa-magnifying-glass absolute left-3 text-gi-gold/70 text-xs"></i>
-                        <input type="text" id="filtroTextoEraTeyvat" value="${escaparHtml(filtroTxt)}" oninput="renderizarDetalleEraTeyvat()" placeholder="Buscar personaje, suceso o lugar dentro de esta época..." class="w-full bg-[#131722] border border-gi-gold/30 rounded-full pl-8 pr-4 py-1.5 text-xs text-gi-cream placeholder-[#7c8599] focus:outline-none focus:border-gi-goldBright">
+                    ${formHito}
+                </div>
+
+                <!-- Eje Horizontal Visual Scrollable con Nodos Clicables -->
+                <div class="relative bg-[#10141f]/90 border-b border-gi-gold/30 shrink-0">
+                    <div class="overflow-x-auto px-6 py-5 flex items-center gap-5 relative">
+                        <div class="absolute left-0 right-0 top-1/2 h-0.5 bg-gradient-to-r from-gi-gold/20 via-gi-gold/70 to-gi-gold/20 pointer-events-none"></div>
+                        ${htmlNodosEje || '<div class="py-8 w-full text-center text-xs text-[#9aa3b8] italic">No hay hitos que coincidan con los filtros activos.</div>'}
                     </div>
                 </div>
 
-                <!-- Línea vertical de Hechos Históricos de la Época -->
-                <div class="ml-3 border-l-2 border-gi-gold/50 space-y-1 pt-1">
-                    ${htmlHechos || '<div class="p-4 text-xs text-gi-cream/70 italic">No hay hechos históricos que coincidan con el filtro.</div>'}
+                <!-- Panel Inferior de Detalle del Hito Seleccionado -->
+                <div class="flex-1 min-h-0 overflow-y-auto p-4 space-y-3 bg-[#141926]/90">
+                    ${htmlDetalleSeleccionado}
                 </div>
             `;
+        }
+
+        async function guardarHitoCronologico(eraId) {
+            const v = id => (document.getElementById(id)?.value || '').trim();
+            const entidad = v('tlEntidad');
+            if (!entidad) { alert('Indica el nombre exacto de la entidad en el grafo.'); return; }
+            const cuerpo = {
+                texto: v('tlTexto'),
+                certeza: v('tlCerteza'),
+                tipo_fuente: 'nota_propia',
+                fuente_titulo: 'Crónica de Teyvat',
+                fuente_url: v('tlFuenteUrl'),
+                era_id: eraId,
+                fecha_lore: v('tlFecha')
+            };
+            const r = await llamadaProcedencia(`/api/procedencia/${encodeURIComponent(entidad)}`, 'POST', cuerpo);
+            if (r) {
+                await cargarLineaTemporalTeyvat(true);
+            }
+        }
+
+        async function borrarHitoCronologico(afirmacionId) {
+            if (!confirm('¿Borrar este hito de la línea temporal?')) return;
+            const r = await llamadaProcedencia(`/api/afirmacion/${encodeURIComponent(afirmacionId)}`, 'DELETE');
+            if (r) {
+                hechoTeyvatSeleccionadoId = null;
+                await cargarLineaTemporalTeyvat(true);
+            }
         }
 
         function alternarVistaEnciclopedia(nodoId) {

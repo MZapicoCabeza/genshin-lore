@@ -152,8 +152,22 @@ def guardar(driver, textos: list[dict]) -> int:
     for t in textos:
         t["fuente"] = FUENTE_URL
         t["fecha_importacion"] = ahora
+
+    # Generar embeddings para búsqueda semántica si el texto es largo o relevante
+    print("Calculando embeddings vectoriales para textos del juego...")
+    textos_para_vec = [f"{t['titulo_obra']} - {t['titulo']}: {t['texto'][:1500]}" for t in textos]
+    vectores = crawler_entidades.calcular_embeddings_lote(textos_para_vec)
+    if len(vectores) == len(textos):
+        for t, vec in zip(textos, vectores):
+            t["embedding"] = vec
+
     with driver.session() as s:
         s.run("CREATE CONSTRAINT textojuego_id IF NOT EXISTS FOR (t:TextoJuego) REQUIRE t.id IS UNIQUE")
+        s.run(
+            "CREATE VECTOR INDEX textojuego_embeddings IF NOT EXISTS "
+            "FOR (t:TextoJuego) ON (t.embedding) "
+            "OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'cosine'}}"
+        )
         for i in range(0, len(textos), 200):
             s.run(
                 """

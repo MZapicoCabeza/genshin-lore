@@ -30,6 +30,8 @@ def validar_afirmacion(datos: dict, parcial: bool = False) -> dict:
         "fuente_ref": 100,
         "version_juego": 20,
         "nota": 1000,
+        "era_id": 60,
+        "fecha_lore": 100,
     }
     for campo, max_len in campos_texto.items():
         if campo in datos:
@@ -61,7 +63,8 @@ def validar_afirmacion(datos: dict, parcial: bool = False) -> dict:
 def _registro_a_dict(a) -> dict:
     return {k: a.get(k) for k in (
         "id", "entidad_id", "texto", "certeza", "estado", "tipo_fuente", "fuente_titulo",
-        "fuente_url", "fuente_ref", "version_juego", "nota", "fecha_captura", "fecha_actualizacion",
+        "fuente_url", "fuente_ref", "version_juego", "nota", "era_id", "fecha_lore",
+        "fecha_captura", "fecha_actualizacion",
     )}
 
 
@@ -73,6 +76,19 @@ def listar_afirmaciones(driver, entidad_id: str) -> list[dict]:
             RETURN a ORDER BY a.fecha_captura DESC
             """,
             id=entidad_id,
+        )
+        return [_registro_a_dict(r["a"]) for r in res]
+
+
+def listar_hitos_cronologicos(driver) -> list[dict]:
+    """Devuelve todas las afirmaciones que tienen asignada una era_id (para la línea temporal de Teyvat)."""
+    with driver.session() as s:
+        res = s.run(
+            """
+            MATCH (a:Afirmacion)
+            WHERE a.era_id IS NOT NULL AND a.era_id <> ''
+            RETURN a ORDER BY a.fecha_captura DESC
+            """
         )
         return [_registro_a_dict(r["a"]) for r in res]
 

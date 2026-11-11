@@ -42,11 +42,53 @@ def reenlazar(driver) -> dict:
     return {"sobre": sobre, "menciona": menciona, "siguiente": siguiente}
 
 
+def indexar_textos_juego_existentes(driver) -> int:
+    """Genera embeddings faltantes para los nodos :TextoJuego ya existentes en Neo4j."""
+    import crawler_entidades
+
+    with driver.session() as s:
+        s.run(
+            "CREATE VECTOR INDEX textojuego_embeddings IF NOT EXISTS "
+            "FOR (t:TextoJuego) ON (t.embedding) "
+            "OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'cosine'}}"
+        )
+        pendientes = s.run(
+            "MATCH (t:TextoJuego) WHERE t.embedding IS NULL AND t.texto IS NOT NULL RETURN t.id AS id, t.titulo AS titulo, t.titulo_obra AS obra, t.texto AS texto"
+        ).data()
+
+    if not pendientes:
+        return 0
+
+    print(f"Generando embeddings vectoriales para {len(pendientes)} textos del juego...")
+    total = 0
+    for i in range(0, len(pendientes), 64):
+        lote = pendientes[i:i + 64]
+        textos_vec = [f"{r.get('obra', '')} - {r.get('titulo', '')}: {(r.get('texto') or '')[:1500]}" for r in lote]
+        vectores = crawler_entidades.calcular_embeddings_lote(textos_vec)
+        if len(vectores) != len(lote):
+            continue
+        pares = [{"id": r["id"], "vec": vec} for r, vec in zip(lote, vectores)]
+        with driver.session() as s:
+            s.run(
+                """
+                UNWIND $pares AS p
+                MATCH (t:TextoJuego {id: p.id})
+                SET t.embedding = p.vec
+                """,
+                pares=pares,
+            )
+        total += len(pares)
+    return total
+
+
 if __name__ == "__main__":
+    import sys
     import crawler_entidades
 
     d = crawler_entidades.crear_driver_neo4j()
     try:
-        print(reenlazar(d))
+        print("Relaciones:", reenlazar(d))
+        if "--indexar" in sys.argv:
+            print("Textos vectorizados:", indexar_textos_juego_existentes(d))
     finally:
         d.close()
