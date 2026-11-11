@@ -1004,6 +1004,12 @@ def ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=
         print("\n⏸️ Crawler detenido manualmente por el usuario. Todo lo procesado hasta aquí ya está guardado en Neo4j.")
     finally:
         try:
+            import enlaces_juego
+
+            print("Reenlazando textos del juego con las entidades:", enlaces_juego.reenlazar(driver_ref[0]))
+        except Exception as e_enl:
+            print(f"   Aviso: no se pudieron reenlazar los textos del juego: {e_enl}")
+        try:
             driver_ref[0].close()
         except Exception:
             pass

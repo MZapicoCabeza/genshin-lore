@@ -786,7 +786,24 @@ def consultar_chatbot_graphrag(req: PeticionChat):
 
         # 3. Recorrido de Grafo (1 salto RELATED_TO) desde las entidades clave
         relaciones_recuperadas = []
+        textos_juego_recuperados = []
         if entidades_clave:
+            # Recuperar textos canon del juego vinculados a estas entidades clave
+            res_tj = session.run(
+                """
+                MATCH (t:TextoJuego)
+                WHERE t.entidad_id IN $ents
+                   OR any(e IN $ents WHERE (t)-[:SOBRE]->(:Entity {id: e}))
+                   OR any(e IN $ents WHERE (t)-[:MENCIONA]->(:Entity {id: e}))
+                RETURN t.id AS id, t.tipo AS tipo, t.titulo AS titulo, t.titulo_obra AS obra,
+                       t.texto AS texto, t.version_juego AS version_juego
+                ORDER BY t.tipo, t.titulo
+                LIMIT 6
+                """,
+                ents=entidades_clave
+            ).data()
+            textos_juego_recuperados.extend(res_tj)
+
             res_rels = session.run(
                 """
                 MATCH (o:Entity)-[r:RELATED_TO]->(d:Entity)
@@ -869,8 +886,18 @@ def consultar_chatbot_graphrag(req: PeticionChat):
             f"Fuente: {rel['ref_titulo']} ({rel['ref_url']})]\n\"{rel['parrafo']}\""
         )
 
+    bloques_contexto_juego = []
+    for idx, tj in enumerate(textos_juego_recuperados[:6], start=1):
+        cuerpo_tj = (tj.get("texto") or "").strip()[:1800]
+        ver_tj = f" (v{tj['version_juego']})" if tj.get("version_juego") else ""
+        bloques_contexto_juego.append(
+            f"[Texto Canon del Juego TJ{idx} | Tipo: {tj.get('tipo', 'juego')} | Título: {tj.get('titulo')}{ver_tj} | Obra: {tj.get('obra')}]\n{cuerpo_tj}"
+        )
+
     contexto_total = (
-        "=== FRAGMENTOS DE PÁGINAS DE LA WIKI (CHUNKS JERÁRQUICOS SMALL-TO-BIG) ===\n"
+        "=== TEXTOS CANON DEL JUEGO (LIBROS, HISTORIAS DE ARMAS Y ARTEFACTOS - AMBER) ===\n"
+        + ("\n\n".join(bloques_contexto_juego) if bloques_contexto_juego else "Sin textos directos del juego.")
+        + "\n\n=== FRAGMENTOS DE PÁGINAS DE LA WIKI (CHUNKS JERÁRQUICOS SMALL-TO-BIG) ===\n"
         + ("\n\n".join(bloques_contexto_chunks) if bloques_contexto_chunks else "Sin fragmentos directos.")
         + "\n\n=== RELACIONES Y CITAS DEL GRAFO DE CONOCIMIENTO (NEO4J) ===\n"
         + ("\n\n".join(bloques_contexto_rels) if bloques_contexto_rels else "Sin relaciones adicionales.")
@@ -881,9 +908,9 @@ def consultar_chatbot_graphrag(req: PeticionChat):
         "a escribir su libro enciclopedia de lore en español.\n"
         "REGLAS ESTRICTAS:\n"
         "1. Responde SIEMPRE en español con estilo enciclopédico, claro, bien estructurado y riguroso.\n"
-        "2. Basa tu respuesta en las Fuentes [F1..Fn] y Relaciones del Grafo [R1..Rn] proporcionadas.\n"
+        "2. Basa tu respuesta con máxima prioridad en los Textos Canon del Juego [TJ1..TJn], seguidos de las Fuentes de la Wiki [F1..Fn] y Relaciones [R1..Rn].\n"
         "3. Cita explícitamente en el texto de dónde sale cada dato usando corchetes, por ejemplo: "
-        "[Capitano - The Cataclysm (F1)] o [Relación Capitano ➔ Mavuika (R2)].\n"
+        "[Libro: The Fox in the Dandelion Sea (TJ1)], [Capitano - The Cataclysm (F1)] o [Relación Capitano ➔ Mavuika (R2)].\n"
         "4. Utiliza la terminología oficial en español de Genshin Impact (Los Once de los Fatui, Reina Menor Kusanali, "
         "Principios Celestiales, Siete Soberanos, Cataclismo, Irminsul, Líneas Ley, Reino de la Noche)."
     )
@@ -1364,6 +1391,34 @@ def obtener_padres_e_hijos(entidad_id: str):
         texto_bruto_completo = asegurar_articulo_completo_wiki(session, id_principal, texto_bruto_mejor)
         texto_limpio, atributos, secciones = parsear_texto_y_atributos_wiki(texto_bruto_completo)
 
+        # Incorporar textos oficiales del cliente de juego (Libros, Armas, Artefactos) como secciones nativas de la entidad
+        recs_juego = session.run(
+            """
+            MATCH (t:TextoJuego)
+            WHERE t.entidad_id = $id OR (t)-[:SOBRE]->(:Entity {id: $id})
+            RETURN t.id AS id, t.tipo AS tipo, t.titulo AS titulo, t.titulo_obra AS obra,
+                   t.texto AS texto, t.version_juego AS version_juego
+            ORDER BY t.tipo, t.titulo
+            """,
+            id=id_principal
+        ).data()
+
+        iconos_tipo = {"libro": "📚", "arma": "⚔️", "artefacto": "🛡️"}
+        for tj in recs_juego:
+            cuerpo = (tj.get("texto") or "").strip()
+            if not cuerpo:
+                continue
+            ico = iconos_tipo.get(tj.get("tipo"), "📖")
+            subtipo = (tj.get("tipo") or "juego").capitalize()
+            ver = f" (v{tj['version_juego']})" if tj.get("version_juego") else ""
+            secciones.append({
+                "titulo": f"{ico} [Juego · {subtipo}] {tj['titulo']}{ver}",
+                "contenido": cuerpo,
+                "es_texto_juego": True,
+                "tipo_juego": tj.get("tipo"),
+                "abierto": False
+            })
+
         conexiones_brutas = [c for c in (record["conexiones"] or []) if c.get("vecino_id")]
 
         vecinos_distintos = list({c["vecino_id"] for c in conexiones_brutas})
@@ -1484,6 +1539,30 @@ try:
     etimologia.asegurar_indices(driver)
 except Exception as _e:
     print(f"⚠️ No se pudieron crear los índices de procedencia/etimología: {_e}")
+
+
+@app.get("/api/textos_juego/{entidad_id:path}")
+def obtener_textos_juego(entidad_id: str):
+    """Textos canon del juego (libros, armas, artefactos) importados de Project Amber que tratan de la entidad."""
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    with driver.session() as session:
+        recs = session.run(
+            """
+            MATCH (t:TextoJuego)
+            WHERE t.entidad_id = $id OR $id IN t.menciona
+            RETURN t.id AS id, t.tipo AS tipo, t.titulo AS titulo, t.titulo_obra AS obra,
+                   t.descripcion AS descripcion, t.texto AS texto, t.version_juego AS version_juego,
+                   t.fuente AS fuente, (t.entidad_id = $id) AS por_titulo
+            ORDER BY por_titulo DESC, t.tipo, t.titulo
+            LIMIT 30
+            """,
+            id=canon_id,
+        )
+        textos = [
+            {**dict(r), "texto": (r["texto"] or "")[:6000], "relacion": "titulo" if r["por_titulo"] else "mencion"}
+            for r in recs
+        ]
+    return {"entidad_id": canon_id, "textos": textos}
 
 
 @app.get("/api/etimologia/{entidad_id:path}")
@@ -4129,7 +4208,36 @@ def interfaz_web():
                 <div class="text-[11px] font-bold uppercase tracking-wider text-gi-gold">Fuentes externas (${afirmaciones.length})</div>
                 ${tarjetas || '<div class="text-xs text-[#7c8599] italic">Sin afirmaciones externas registradas.</div>'}
                 ${formulario}
+                <div id="contenedorTextosJuego" class="space-y-2 pt-1"></div>
             `;
+            cargarTextosJuego(nodoId);
+        }
+
+        async function cargarTextosJuego(nodoId) {
+            const cont = document.getElementById('contenedorTextosJuego');
+            if (!cont) return;
+            try {
+                const d = await (await fetch(`/api/textos_juego/${encodeURIComponent(nodoId)}`)).json();
+                const textos = d.textos || [];
+                if (!textos.length) { cont.innerHTML = ''; return; }
+                const TIPO = { libro: '📚 Libro', arma: '⚔️ Arma', artefacto: '🛡️ Artefacto' };
+                cont.innerHTML = `
+                    <div class="text-[11px] font-bold uppercase tracking-wider text-gi-gold">Textos del juego · canon (${textos.length})</div>
+                    ${textos.map(t => `
+                        <details class="rounded-lg bg-[#181d2b] border border-emerald-400/25">
+                            <summary class="px-3 py-2 cursor-pointer select-none list-none text-xs text-gi-cream flex flex-wrap items-center gap-1.5">
+                                <span class="px-2 py-0.5 rounded-full border font-bold text-[10px] ${CERTEZA_UI.canon.clase}">Canon</span>
+                                <span class="text-[10px] text-[#9fd6e3]">${TIPO[t.tipo] || escaparHtml(t.tipo)}</span>
+                                <span class="font-semibold">${escaparHtml(t.titulo)}</span>
+                                ${t.relacion === 'mencion' ? '<span class="text-[10px] text-[#9aa3b8]">· la menciona (detección automática)</span>' : ''}
+                                ${t.version_juego ? `<span class="text-[10px] text-[#9aa3b8] ml-auto">v${escaparHtml(t.version_juego)}</span>` : ''}
+                            </summary>
+                            <div class="px-3 py-2.5 border-t border-emerald-400/20 text-xs text-gi-cream/90 leading-relaxed whitespace-pre-line max-h-72 overflow-y-auto">${escaparHtml(t.texto)}</div>
+                            <div class="px-3 pb-2 text-[10px] text-[#7c8599]">Fuente: Project Amber (gi.yatta.moe)${t.obra && t.obra !== t.titulo ? ' · ' + escaparHtml(t.obra) : ''} · texto original en inglés</div>
+                        </details>`).join('')}`;
+            } catch (e) {
+                cont.innerHTML = '';
+            }
         }
 
         async function guardarAfirmacion(nodoId) {
