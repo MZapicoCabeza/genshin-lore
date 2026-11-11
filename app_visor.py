@@ -1,15 +1,18 @@
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
 import requests
-from fastapi import FastAPI
+from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 import uvicorn
 import crawler_entidades
+import etimologia
+import procedencia
 
 NEO4J_URI = os.getenv("NEO4J_URI", crawler_entidades.NEO4J_URI).strip()
 NEO4J_USER = os.getenv("NEO4J_USER", crawler_entidades.NEO4J_USER).strip()
@@ -1417,6 +1420,128 @@ def obtener_padres_e_hijos(entidad_id: str):
             "secciones": secciones,
             "conexiones": conexiones_unificadas,
         }
+
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+
+def _exigir_admin(token: str | None):
+    """Las escrituras de procedencia solo se permiten con ADMIN_TOKEN configurado y correcto."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Edición deshabilitada: define ADMIN_TOKEN en el servidor.")
+    if not token or not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Token de administrador incorrecto.")
+
+
+@app.get("/api/procedencia/{entidad_id:path}")
+def obtener_procedencia(entidad_id: str):
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    return {
+        "entidad_id": canon_id,
+        "canon": {
+            "tipo_fuente": "wiki",
+            "fuente_titulo": "Genshin Impact Wiki (Fandom)",
+            "fuente_url": f"{WIKI_BASE_URL}{canon_id.replace(' ', '_')}",
+        },
+        "afirmaciones": procedencia.listar_afirmaciones(driver, canon_id),
+        "edicion_habilitada": bool(ADMIN_TOKEN),
+    }
+
+
+@app.post("/api/procedencia/{entidad_id:path}")
+def crear_procedencia(entidad_id: str, datos: dict = Body(...), x_admin_token: str | None = Header(default=None)):
+    _exigir_admin(x_admin_token)
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    try:
+        return procedencia.crear_afirmacion(driver, canon_id, datos)
+    except procedencia.ErrorValidacion as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/api/afirmacion/{afirmacion_id}")
+def editar_afirmacion(afirmacion_id: str, datos: dict = Body(...), x_admin_token: str | None = Header(default=None)):
+    _exigir_admin(x_admin_token)
+    try:
+        return procedencia.actualizar_afirmacion(driver, afirmacion_id, datos)
+    except procedencia.ErrorValidacion as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.delete("/api/afirmacion/{afirmacion_id}")
+def eliminar_afirmacion(afirmacion_id: str, x_admin_token: str | None = Header(default=None)):
+    _exigir_admin(x_admin_token)
+    if not procedencia.borrar_afirmacion(driver, afirmacion_id):
+        raise HTTPException(status_code=404, detail="Afirmación no encontrada")
+    return {"ok": True}
+
+
+try:
+    procedencia.asegurar_indices(driver)
+    etimologia.asegurar_indices(driver)
+except Exception as _e:
+    print(f"⚠️ No se pudieron crear los índices de procedencia/etimología: {_e}")
+
+
+@app.get("/api/etimologia/{entidad_id:path}")
+def obtener_etimologia(entidad_id: str):
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    return {
+        "entidad_id": canon_id,
+        "ficha": etimologia.obtener(driver, canon_id),
+        "wiki_url": f"{WIKI_BASE_URL}{canon_id.replace(' ', '_')}",
+        "edicion_habilitada": bool(ADMIN_TOKEN),
+    }
+
+
+@app.put("/api/etimologia/{entidad_id:path}")
+def guardar_etimologia(entidad_id: str, datos: dict = Body(...), x_admin_token: str | None = Header(default=None)):
+    _exigir_admin(x_admin_token)
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    try:
+        return etimologia.guardar(driver, canon_id, datos)
+    except etimologia.ErrorValidacion as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.delete("/api/etimologia/{entidad_id:path}")
+def eliminar_etimologia(entidad_id: str, x_admin_token: str | None = Header(default=None)):
+    _exigir_admin(x_admin_token)
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    if not etimologia.borrar(driver, canon_id):
+        raise HTTPException(status_code=404, detail="No hay ficha de etimología para esta entidad")
+    return {"ok": True}
+
+
+@app.post("/api/etimologia_borrador/{entidad_id:path}")
+def borrador_resumen_wiki(entidad_id: str, x_admin_token: str | None = Header(default=None)):
+    """Genera (sin guardar) un resumen en español del artículo de la Wiki, usando solo ese texto."""
+    _exigir_admin(x_admin_token)
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY no configurada en el servidor.")
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    with driver.session() as session:
+        rec = session.run("MATCH (e:Entity {id: $id}) RETURN e.texto_web AS t", id=canon_id).single()
+        texto_bruto = asegurar_articulo_completo_wiki(session, canon_id, (rec["t"] if rec else "") or "")
+    texto, _, _ = parsear_texto_y_atributos_wiki(texto_bruto)
+    if not texto or not texto.strip():
+        raise HTTPException(status_code=404, detail="No hay texto de la Wiki para resumir.")
+    instruccion = (
+        "Resume en español, en 3 a 5 frases, el artículo de la Wiki de Genshin Impact que te paso. "
+        "Usa ÚNICAMENTE información presente en el texto: no añadas etimologías, teorías ni datos externos. "
+        "Devuelve solo el resumen."
+    )
+    resumen, err = llamar_gemini_con_fallback(
+        instruccion, [{"role": "user", "parts": [{"text": texto[:12000]}]}], temperature=0.2
+    )
+    if not resumen:
+        raise HTTPException(status_code=502, detail=err or "No se pudo generar el resumen.")
+    return {"resumen_wiki": resumen[:3000], "resumen_auto": True}
 
 
 RUTA_ICONO_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icono.png")
@@ -3839,11 +3964,298 @@ def interfaz_web():
                         </div>
                     </details>
 
+                    <!-- 5. DESPLEGABLE: Procedencia y Certeza (fuentes externas: vídeos, Reddit, notas) -->
+                    <details class="gi-card-inner rounded-xl overflow-hidden group" ontoggle="if(this.open) cargarProcedencia('${escaparComillas(n.id)}')">
+                        <summary class="px-4 py-3 cursor-pointer select-none flex items-center justify-between gap-2 bg-gradient-to-r from-[#242c40] to-[#181d2b] hover:from-[#2c364f] transition list-none">
+                            <div class="flex items-center gap-2.5">
+                                <span class="w-6 h-6 rounded-full bg-gi-gold/20 border border-gi-gold/50 flex items-center justify-center text-gi-goldBright text-xs">🔎</span>
+                                <div>
+                                    <div class="font-serif font-bold text-xs md:text-sm text-gi-goldBright tracking-wide">Procedencia y Certeza</div>
+                                    <div class="text-[10px] text-[#9aa3b8]">Canon de la Wiki frente a teorías y fuentes externas</div>
+                                </div>
+                            </div>
+                            <span class="text-[10px] px-2.5 py-0.5 rounded-full bg-gi-gold/20 text-gi-goldBright border border-gi-gold/40 font-semibold">Desplegar ▾</span>
+                        </summary>
+                        <div id="contenedorProcedencia" class="p-3.5 border-t border-gi-gold/25 space-y-3 bg-[#151925]/90">
+                            <div class="text-xs text-[#9aa3b8] italic">Cargando...</div>
+                        </div>
+                    </details>
+
+                    <!-- 6. DESPLEGABLE: Etimología y Mundo Real -->
+                    <details class="gi-card-inner rounded-xl overflow-hidden group" ontoggle="if(this.open) cargarEtimologia('${escaparComillas(n.id)}')">
+                        <summary class="px-4 py-3 cursor-pointer select-none flex items-center justify-between gap-2 bg-gradient-to-r from-[#242c40] to-[#181d2b] hover:from-[#2c364f] transition list-none">
+                            <div class="flex items-center gap-2.5">
+                                <span class="w-6 h-6 rounded-full bg-gi-gold/20 border border-gi-gold/50 flex items-center justify-center text-gi-goldBright text-xs">🌍</span>
+                                <div>
+                                    <div class="font-serif font-bold text-xs md:text-sm text-gi-goldBright tracking-wide">Etimología y Mundo Real</div>
+                                    <div class="text-[10px] text-[#9aa3b8]">Origen del nombre, mitología y resumen de la Wiki</div>
+                                </div>
+                            </div>
+                            <span class="text-[10px] px-2.5 py-0.5 rounded-full bg-gi-gold/20 text-gi-goldBright border border-gi-gold/40 font-semibold">Desplegar ▾</span>
+                        </summary>
+                        <div id="contenedorEtimologia" class="p-3.5 border-t border-gi-gold/25 space-y-3 bg-[#151925]/90">
+                            <div class="text-xs text-[#9aa3b8] italic">Cargando...</div>
+                        </div>
+                    </details>
+
                 </div>
             `;
 
             alternarVistaEnciclopedia(n.id);
             inspector.scrollTop = 0;
+        }
+
+        const cacheEtimologia = {};
+        const CERTEZA_UI = {
+            canon: { etiqueta: 'Canon', clase: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/40' },
+            inferido: { etiqueta: 'Inferido', clase: 'bg-amber-500/15 text-amber-300 border-amber-400/40' },
+            teoria: { etiqueta: 'Teoría', clase: 'bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-400/40' }
+        };
+        const ESTADO_UI = { vigente: 'Vigente', en_revision: 'En revisión', refutada: 'Refutada' };
+        const TIPO_FUENTE_UI = { wiki: 'Wiki', juego: 'Juego', youtube: 'YouTube', reddit: 'Reddit', nota_propia: 'Nota propia', otro: 'Otra' };
+
+        function urlSegura(u) {
+            return (u && /^https?:\/\//i.test(u)) ? u : '';
+        }
+
+        function tokenAdmin(forzarPedir) {
+            let t = localStorage.getItem('adminToken') || '';
+            if (!t || forzarPedir) {
+                t = (prompt('Token de administrador para editar la procedencia:') || '').trim();
+                if (t) localStorage.setItem('adminToken', t);
+            }
+            return t;
+        }
+
+        async function llamadaProcedencia(url, metodo, cuerpo) {
+            const token = tokenAdmin(false);
+            if (!token) return null;
+            const res = await fetch(url, {
+                method: metodo,
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
+                body: cuerpo ? JSON.stringify(cuerpo) : undefined
+            });
+            if (res.status === 401) { localStorage.removeItem('adminToken'); }
+            if (!res.ok) {
+                let msg = res.statusText;
+                try { msg = (await res.json()).detail || msg; } catch (e) {}
+                alert('Error: ' + msg);
+                return null;
+            }
+            return await res.json();
+        }
+
+        async function cargarProcedencia(nodoId) {
+            const cont = document.getElementById('contenedorProcedencia');
+            if (!cont) return;
+            try {
+                const res = await fetch(`/api/procedencia/${encodeURIComponent(nodoId)}`);
+                const data = await res.json();
+                renderizarProcedencia(nodoId, data);
+            } catch (e) {
+                cont.innerHTML = '<div class="text-xs text-rose-300">No se pudo cargar la procedencia.</div>';
+            }
+        }
+
+        function renderizarProcedencia(nodoId, data) {
+            const cont = document.getElementById('contenedorProcedencia');
+            if (!cont) return;
+            const idJs = escaparComillas(nodoId);
+            const canonUrl = urlSegura(data.canon && data.canon.fuente_url);
+            const afirmaciones = data.afirmaciones || [];
+
+            const tarjetas = afirmaciones.map(a => {
+                const cz = CERTEZA_UI[a.certeza] || CERTEZA_UI.teoria;
+                const url = urlSegura(a.fuente_url);
+                const refutada = a.estado === 'refutada';
+                const idA = escaparComillas(a.id);
+                return `
+                <div class="p-3 rounded-lg bg-[#181d2b] border border-gi-gold/25 space-y-1.5 ${refutada ? 'opacity-60' : ''}">
+                    <div class="flex flex-wrap items-center gap-1.5 text-[10px]">
+                        <span class="px-2 py-0.5 rounded-full border font-bold ${cz.clase}">${cz.etiqueta}</span>
+                        <span class="px-2 py-0.5 rounded-full bg-[#243242] text-[#9fd6e3] border border-[#9fd6e3]/30">${escaparHtml(TIPO_FUENTE_UI[a.tipo_fuente] || a.tipo_fuente)}</span>
+                        <span class="px-2 py-0.5 rounded-full bg-[#2e2a22] text-gi-goldBright border border-gi-gold/30">${escaparHtml(ESTADO_UI[a.estado] || a.estado)}</span>
+                        ${a.version_juego ? `<span class="text-[#9aa3b8]">v${escaparHtml(a.version_juego)}</span>` : ''}
+                        <span class="text-[#7c8599] ml-auto">${escaparHtml((a.fecha_captura || '').slice(0, 10))}</span>
+                    </div>
+                    <div class="text-xs text-gi-cream leading-relaxed ${refutada ? 'line-through' : ''}">${escaparHtml(a.texto)}</div>
+                    ${a.nota ? `<div class="text-[11px] text-[#b6afa0] italic">${escaparHtml(a.nota)}</div>` : ''}
+                    <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                        ${url ? `<a href="${escaparHtml(url)}" target="_blank" rel="noopener noreferrer" class="text-[#9fd6e3] hover:underline">${escaparHtml(a.fuente_titulo || 'Fuente')}${a.fuente_ref ? ' · ' + escaparHtml(a.fuente_ref) : ''} ↗</a>` : `<span class="text-[#9aa3b8]">${escaparHtml(a.fuente_titulo || 'Sin enlace')}</span>`}
+                        ${data.edicion_habilitada ? `
+                        <span class="ml-auto flex gap-1.5">
+                            <select onchange="cambiarCampoAfirmacion('${idJs}', '${idA}', 'certeza', this.value)" class="bg-[#131722] border border-gi-gold/30 rounded px-1 py-0.5 text-[10px] text-gi-cream">
+                                ${Object.keys(CERTEZA_UI).map(k => `<option value="${k}" ${k === a.certeza ? 'selected' : ''}>${CERTEZA_UI[k].etiqueta}</option>`).join('')}
+                            </select>
+                            <select onchange="cambiarCampoAfirmacion('${idJs}', '${idA}', 'estado', this.value)" class="bg-[#131722] border border-gi-gold/30 rounded px-1 py-0.5 text-[10px] text-gi-cream">
+                                ${Object.keys(ESTADO_UI).map(k => `<option value="${k}" ${k === a.estado ? 'selected' : ''}>${ESTADO_UI[k]}</option>`).join('')}
+                            </select>
+                            <button onclick="borrarAfirmacion('${idJs}', '${idA}')" class="px-2 py-0.5 rounded bg-[#351f26] border border-rose-400/40 text-rose-200 text-[10px]">Borrar</button>
+                        </span>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+
+            const formulario = data.edicion_habilitada ? `
+                <details class="rounded-xl border border-gi-gold/35 bg-[#181d2b]/90 overflow-hidden">
+                    <summary class="px-3.5 py-2 cursor-pointer select-none list-none text-[11px] font-bold uppercase tracking-wider text-gi-goldBright hover:bg-[#1f2638]">+ Añadir afirmación</summary>
+                    <div class="p-3 border-t border-gi-gold/20 space-y-2 text-xs">
+                        <textarea id="procTexto" rows="3" placeholder="Afirmación o dato..." class="w-full bg-[#131722] border border-gi-gold/30 rounded p-2 text-gi-cream"></textarea>
+                        <div class="grid grid-cols-2 gap-2">
+                            <select id="procCerteza" class="bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                                ${Object.keys(CERTEZA_UI).map(k => `<option value="${k}" ${k === 'teoria' ? 'selected' : ''}>${CERTEZA_UI[k].etiqueta}</option>`).join('')}
+                            </select>
+                            <select id="procTipo" class="bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                                ${Object.keys(TIPO_FUENTE_UI).map(k => `<option value="${k}">${TIPO_FUENTE_UI[k]}</option>`).join('')}
+                            </select>
+                            <input id="procTitulo" placeholder="Título de la fuente" class="bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                            <input id="procUrl" placeholder="URL (https://...)" class="bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                            <input id="procRef" placeholder="Minuto / hilo (ej. 12:34)" class="bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                            <input id="procVersion" placeholder="Versión del juego (ej. 5.0)" class="bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                        </div>
+                        <input id="procNota" placeholder="Nota (opcional)" class="w-full bg-[#131722] border border-gi-gold/30 rounded p-1 text-gi-cream">
+                        <button onclick="guardarAfirmacion('${idJs}')" class="gi-btn-cream px-3 py-1.5 text-[11px]">Guardar</button>
+                    </div>
+                </details>` : '<div class="text-[10px] text-[#7c8599] italic">Edición deshabilitada (define ADMIN_TOKEN en el servidor para añadir afirmaciones).</div>';
+
+            cont.innerHTML = `
+                <div class="p-3 rounded-lg bg-[#181d2b] border border-emerald-400/30 space-y-1">
+                    <div class="flex items-center gap-1.5 text-[10px]">
+                        <span class="px-2 py-0.5 rounded-full border font-bold ${CERTEZA_UI.canon.clase}">Canon</span>
+                        <span class="text-[#9aa3b8]">Texto de la Wiki, mostrado en las demás secciones</span>
+                    </div>
+                    ${canonUrl ? `<a href="${escaparHtml(canonUrl)}" target="_blank" rel="noopener noreferrer" class="text-[11px] text-[#9fd6e3] hover:underline">${escaparHtml(data.canon.fuente_titulo)} ↗</a>` : ''}
+                </div>
+                <div class="text-[11px] font-bold uppercase tracking-wider text-gi-gold">Fuentes externas (${afirmaciones.length})</div>
+                ${tarjetas || '<div class="text-xs text-[#7c8599] italic">Sin afirmaciones externas registradas.</div>'}
+                ${formulario}
+            `;
+        }
+
+        async function guardarAfirmacion(nodoId) {
+            const v = id => (document.getElementById(id)?.value || '').trim();
+            const cuerpo = {
+                texto: v('procTexto'), certeza: v('procCerteza'), tipo_fuente: v('procTipo'),
+                fuente_titulo: v('procTitulo'), fuente_url: v('procUrl'), fuente_ref: v('procRef'),
+                version_juego: v('procVersion'), nota: v('procNota')
+            };
+            const r = await llamadaProcedencia(`/api/procedencia/${encodeURIComponent(nodoId)}`, 'POST', cuerpo);
+            if (r) cargarProcedencia(nodoId);
+        }
+
+        async function cambiarCampoAfirmacion(nodoId, idA, campo, valor) {
+            const r = await llamadaProcedencia(`/api/afirmacion/${encodeURIComponent(idA)}`, 'PATCH', { [campo]: valor });
+            if (r) cargarProcedencia(nodoId);
+        }
+
+        async function borrarAfirmacion(nodoId, idA) {
+            if (!confirm('¿Borrar esta afirmación?')) return;
+            const r = await llamadaProcedencia(`/api/afirmacion/${encodeURIComponent(idA)}`, 'DELETE');
+            if (r) cargarProcedencia(nodoId);
+        }
+
+        // ---------- Etimología y Mundo Real ----------
+        async function cargarEtimologia(nodoId) {
+            const cont = document.getElementById('contenedorEtimologia');
+            if (!cont) return;
+            try {
+                const res = await fetch(`/api/etimologia/${encodeURIComponent(nodoId)}`);
+                renderizarEtimologia(nodoId, await res.json(), false);
+            } catch (e) {
+                cont.innerHTML = '<div class="text-xs text-rose-300">No se pudo cargar la etimología.</div>';
+            }
+        }
+
+        function filaEtim(etiqueta, valor) {
+            if (!valor) return '';
+            return `<div class="p-2.5 rounded-lg bg-[#181d2b] border border-gi-gold/25">
+                <div class="text-[10px] font-bold uppercase tracking-wider text-gi-gold mb-0.5">${etiqueta}</div>
+                <div class="text-xs text-gi-cream leading-relaxed whitespace-pre-line">${escaparHtml(valor)}</div>
+            </div>`;
+        }
+
+        function renderizarEtimologia(nodoId, data, editando) {
+            const cont = document.getElementById('contenedorEtimologia');
+            if (!cont) return;
+            cacheEtimologia[nodoId] = data;
+            const f = data.ficha;
+            const idJs = escaparComillas(nodoId);
+            const botones = data.edicion_habilitada ? `
+                <div class="flex gap-2">
+                    <button onclick="renderizarEtimologia('${idJs}', cacheEtimologia['${idJs}'], ${!editando})" class="gi-btn-dark px-3 py-1 text-[11px]">${editando ? 'Cancelar' : (f ? 'Editar' : 'Crear ficha')}</button>
+                    ${f && !editando ? `<button onclick="borrarEtimologia('${idJs}')" class="px-3 py-1 rounded bg-[#351f26] border border-rose-400/40 text-rose-200 text-[11px]">Borrar</button>` : ''}
+                </div>` : '';
+
+            if (editando) {
+                const v = k => escaparHtml((f && f[k]) || '');
+                const refs = ((f && f.referencias) || []).map(r => (r.titulo || '') + ' | ' + (r.url || '')).join('\n');
+                const estilo = 'w-full bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-xs text-gi-cream';
+                cont.innerHTML = `
+                    ${botones}
+                    <div class="space-y-2 text-xs">
+                        <textarea id="etOrigen" rows="3" placeholder="Origen del nombre (ej. Paimon viene de...)" class="${estilo}">${v('origen_nombre')}</textarea>
+                        <div class="grid grid-cols-2 gap-2">
+                            <input id="etIdioma" placeholder="Idioma de origen" value="${v('idioma_origen')}" class="${estilo}">
+                            <input id="etCultura" placeholder="Cultura / mitología" value="${v('cultura')}" class="${estilo}">
+                        </div>
+                        <textarea id="etRef" rows="2" placeholder="Referencia del mundo real (mito, obra, figura...)" class="${estilo}">${v('referencia_real')}</textarea>
+                        <textarea id="etResumen" rows="4" placeholder="Resumen de la Wiki" class="${estilo}">${v('resumen_wiki')}</textarea>
+                        <label class="flex items-center gap-1.5 text-[11px] text-[#9aa3b8]"><input type="checkbox" id="etResumenAuto" ${(f && f.resumen_auto) ? 'checked' : ''}> Resumen generado automáticamente (sin revisar)</label>
+                        <button onclick="generarBorradorResumen('${idJs}')" class="gi-btn-dark px-3 py-1 text-[11px]">✨ Generar borrador del resumen con Gemini</button>
+                        <textarea id="etRefs" rows="3" placeholder="Referencias, una por línea: Título | https://url" class="${estilo}">${escaparHtml(refs)}</textarea>
+                        <button onclick="guardarEtimologia('${idJs}')" class="gi-btn-cream px-3 py-1.5 text-[11px]">Guardar</button>
+                    </div>`;
+                return;
+            }
+
+            if (!f) {
+                cont.innerHTML = `${botones}
+                    <div class="text-xs text-[#7c8599] italic">Sin ficha de etimología para esta entidad.</div>
+                    <a href="${escaparHtml(urlSegura(data.wiki_url))}" target="_blank" rel="noopener noreferrer" class="text-[11px] text-[#9fd6e3] hover:underline">Ver en la Wiki ↗</a>`;
+                return;
+            }
+            const refsHtml = (f.referencias || []).map(r => {
+                const u = urlSegura(r.url);
+                return u
+                    ? `<li><a href="${escaparHtml(u)}" target="_blank" rel="noopener noreferrer" class="text-[#9fd6e3] hover:underline">${escaparHtml(r.titulo || u)} ↗</a></li>`
+                    : `<li class="text-[#9aa3b8]">${escaparHtml(r.titulo)}</li>`;
+            }).join('');
+            const meta = [f.idioma_origen, f.cultura].filter(Boolean).join(' · ');
+            cont.innerHTML = `
+                ${botones}
+                ${filaEtim('Origen del nombre' + (meta ? ' (' + escaparHtml(meta) + ')' : ''), f.origen_nombre)}
+                ${filaEtim('Referencia del mundo real', f.referencia_real)}
+                ${filaEtim('Resumen de la Wiki' + (f.resumen_auto ? ' · automático, sin revisar' : ''), f.resumen_wiki)}
+                ${refsHtml ? `<div class="p-2.5 rounded-lg bg-[#181d2b] border border-gi-gold/25"><div class="text-[10px] font-bold uppercase tracking-wider text-gi-gold mb-1">Referencias</div><ul class="text-xs space-y-0.5 list-disc ml-4">${refsHtml}</ul></div>` : ''}
+                <a href="${escaparHtml(urlSegura(data.wiki_url))}" target="_blank" rel="noopener noreferrer" class="text-[11px] text-[#9fd6e3] hover:underline">Ver en la Wiki ↗</a>`;
+        }
+
+        async function guardarEtimologia(nodoId) {
+            const v = id => (document.getElementById(id)?.value || '').trim();
+            const referencias = v('etRefs').split(String.fromCharCode(10)).map(l => l.trim()).filter(Boolean).map(l => {
+                const i = l.lastIndexOf('|');
+                return i >= 0 ? { titulo: l.slice(0, i).trim(), url: l.slice(i + 1).trim() } : { titulo: l, url: '' };
+            });
+            const cuerpo = {
+                origen_nombre: v('etOrigen'), idioma_origen: v('etIdioma'), cultura: v('etCultura'),
+                referencia_real: v('etRef'), resumen_wiki: v('etResumen'),
+                resumen_auto: Boolean(document.getElementById('etResumenAuto')?.checked), referencias
+            };
+            const r = await llamadaProcedencia(`/api/etimologia/${encodeURIComponent(nodoId)}`, 'PUT', cuerpo);
+            if (r) cargarEtimologia(nodoId);
+        }
+
+        async function borrarEtimologia(nodoId) {
+            if (!confirm('¿Borrar la ficha de etimología de esta entidad?')) return;
+            const r = await llamadaProcedencia(`/api/etimologia/${encodeURIComponent(nodoId)}`, 'DELETE');
+            if (r) cargarEtimologia(nodoId);
+        }
+
+        async function generarBorradorResumen(nodoId) {
+            const r = await llamadaProcedencia(`/api/etimologia_borrador/${encodeURIComponent(nodoId)}`, 'POST');
+            if (!r) return;
+            document.getElementById('etResumen').value = r.resumen_wiki;
+            document.getElementById('etResumenAuto').checked = true;
         }
 
         function mostrarFichaArista(edgeId) {

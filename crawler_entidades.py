@@ -902,7 +902,7 @@ def limpiar_base_de_datos(driver):
         while True:
             res = session.run(
                 """
-                MATCH (n)
+                MATCH (n) WHERE n:Entity OR n:Chunk
                 WITH n LIMIT 4000
                 DETACH DELETE n
                 RETURN count(*) AS borrados
