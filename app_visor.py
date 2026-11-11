@@ -1692,12 +1692,36 @@ def obtener_textos_juego(entidad_id: str):
 @app.get("/api/etimologia/{entidad_id:path}")
 def obtener_etimologia(entidad_id: str):
     canon_id = obtener_nombre_canonico(entidad_id.strip())
+    ficha = etimologia.obtener(driver, canon_id)
+    # Si aún no tiene resumen de Wikipedia guardado en Neo4j, intentar buscarlo y persistirlo automáticamente
+    if not ficha or not ficha.get("wikipedia_resumen"):
+        wiki_data = etimologia.buscar_en_wikipedia(canon_id)
+        if wiki_data:
+            try:
+                ficha = etimologia.guardar_wikipedia(driver, canon_id, wiki_data)
+            except LookupError:
+                pass
     return {
         "entidad_id": canon_id,
-        "ficha": etimologia.obtener(driver, canon_id),
+        "ficha": ficha,
         "wiki_url": f"{WIKI_BASE_URL}{canon_id.replace(' ', '_')}",
         "edicion_habilitada": bool(ADMIN_TOKEN),
     }
+
+
+@app.post("/api/etimologia_wikipedia/{entidad_id:path}")
+def buscar_y_guardar_wikipedia(entidad_id: str, datos: dict = Body(default={}), x_admin_token: str | None = Header(default=None)):
+    """Busca un término concreto en Wikipedia real (ES/EN) y guarda su resumen en Neo4j para esa entidad."""
+    _exigir_admin(x_admin_token)
+    canon_id = obtener_nombre_canonico(entidad_id.strip())
+    termino = (datos.get("termino") or canon_id).strip()
+    wiki_data = etimologia.buscar_en_wikipedia(termino)
+    if not wiki_data:
+        raise HTTPException(status_code=404, detail=f"No se encontró artículo en Wikipedia para '{termino}'.")
+    try:
+        return etimologia.guardar_wikipedia(driver, canon_id, wiki_data)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.put("/api/etimologia/{entidad_id:path}")
@@ -4523,6 +4547,17 @@ def interfaz_web():
                 const estilo = 'w-full bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-xs text-gi-cream';
                 cont.innerHTML = `
                     ${botones}
+                    <div class="p-2.5 rounded-lg bg-[#181d2b] border border-[#9fd6e3]/30 space-y-1.5 text-xs">
+                        <div class="text-[10px] font-bold uppercase tracking-wider text-[#9fd6e3]">🌐 Importar resumen desde Wikipedia (se guarda en la BBDD)</div>
+                        <div class="flex gap-2">
+                            <input id="etWikiTerm" placeholder="Término en Wikipedia (ej. Icor, Paimon, Ars Goetia)" value="${v('wikipedia_titulo') || escaparHtml(nodoId)}" class="flex-1 bg-[#131722] border border-gi-gold/30 rounded p-1.5 text-xs text-gi-cream">
+                            <button onclick="buscarWikipediaParaFicha('${idJs}')" class="gi-btn-dark px-3 py-1 text-[11px] shrink-0">Buscar y guardar</button>
+                        </div>
+                        <textarea id="etWikiResumen" rows="3" placeholder="Resumen de Wikipedia guardado en Neo4j..." class="${estilo}">${v('wikipedia_resumen')}</textarea>
+                        <input type="hidden" id="etWikiTitulo" value="${v('wikipedia_titulo')}">
+                        <input type="hidden" id="etWikiUrl" value="${v('wikipedia_url')}">
+                        <input type="hidden" id="etWikiIdioma" value="${v('wikipedia_idioma')}">
+                    </div>
                     <div class="space-y-2 text-xs">
                         <textarea id="etOrigen" rows="3" placeholder="Origen del nombre (ej. Paimon viene de...)" class="${estilo}">${v('origen_nombre')}</textarea>
                         <div class="grid grid-cols-2 gap-2">
@@ -4530,7 +4565,7 @@ def interfaz_web():
                             <input id="etCultura" placeholder="Cultura / mitología" value="${v('cultura')}" class="${estilo}">
                         </div>
                         <textarea id="etRef" rows="2" placeholder="Referencia del mundo real (mito, obra, figura...)" class="${estilo}">${v('referencia_real')}</textarea>
-                        <textarea id="etResumen" rows="4" placeholder="Resumen de la Wiki" class="${estilo}">${v('resumen_wiki')}</textarea>
+                        <textarea id="etResumen" rows="4" placeholder="Resumen de la Wiki de Genshin" class="${estilo}">${v('resumen_wiki')}</textarea>
                         <label class="flex items-center gap-1.5 text-[11px] text-[#9aa3b8]"><input type="checkbox" id="etResumenAuto" ${(f && f.resumen_auto) ? 'checked' : ''}> Resumen generado automáticamente (sin revisar)</label>
                         <button onclick="generarBorradorResumen('${idJs}')" class="gi-btn-dark px-3 py-1 text-[11px]">✨ Generar borrador del resumen con Gemini</button>
                         <textarea id="etRefs" rows="3" placeholder="Referencias, una por línea: Título | https://url" class="${estilo}">${escaparHtml(refs)}</textarea>
@@ -4541,7 +4576,7 @@ def interfaz_web():
 
             if (!f) {
                 cont.innerHTML = `${botones}
-                    <div class="text-xs text-[#7c8599] italic">Sin ficha de etimología para esta entidad.</div>
+                    <div class="text-xs text-[#7c8599] italic">Sin ficha de etimología ni artículo coincidente en Wikipedia para esta entidad.</div>
                     <a href="${escaparHtml(urlSegura(data.wiki_url))}" target="_blank" rel="noopener noreferrer" class="text-[11px] text-[#9fd6e3] hover:underline">Ver en la Wiki ↗</a>`;
                 return;
             }
@@ -4552,13 +4587,35 @@ def interfaz_web():
                     : `<li class="text-[#9aa3b8]">${escaparHtml(r.titulo)}</li>`;
             }).join('');
             const meta = [f.idioma_origen, f.cultura].filter(Boolean).join(' · ');
+            const wikiUrlReal = urlSegura(f.wikipedia_url);
+            const bloqueWikipedia = f.wikipedia_resumen ? `
+                <div class="p-3 rounded-lg bg-[#162030] border border-[#9fd6e3]/40 space-y-1.5">
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-[10px] font-bold uppercase tracking-wider text-[#9fd6e3]">🌐 Wikipedia (${escaparHtml((f.wikipedia_idioma || 'es').toUpperCase())}) · ${escaparHtml(f.wikipedia_titulo || '')}</span>
+                        ${wikiUrlReal ? `<a href="${escaparHtml(wikiUrlReal)}" target="_blank" rel="noopener noreferrer" class="text-[10px] text-[#9fd6e3] hover:underline">Leer en Wikipedia ↗</a>` : ''}
+                    </div>
+                    <div class="text-xs text-gi-cream/95 leading-relaxed whitespace-pre-line">${escaparHtml(f.wikipedia_resumen)}</div>
+                </div>` : '';
             cont.innerHTML = `
                 ${botones}
+                ${bloqueWikipedia}
                 ${filaEtim('Origen del nombre' + (meta ? ' (' + escaparHtml(meta) + ')' : ''), f.origen_nombre)}
                 ${filaEtim('Referencia del mundo real', f.referencia_real)}
-                ${filaEtim('Resumen de la Wiki' + (f.resumen_auto ? ' · automático, sin revisar' : ''), f.resumen_wiki)}
+                ${filaEtim('Resumen de la Wiki de Genshin' + (f.resumen_auto ? ' · automático, sin revisar' : ''), f.resumen_wiki)}
                 ${refsHtml ? `<div class="p-2.5 rounded-lg bg-[#181d2b] border border-gi-gold/25"><div class="text-[10px] font-bold uppercase tracking-wider text-gi-gold mb-1">Referencias</div><ul class="text-xs space-y-0.5 list-disc ml-4">${refsHtml}</ul></div>` : ''}
                 <a href="${escaparHtml(urlSegura(data.wiki_url))}" target="_blank" rel="noopener noreferrer" class="text-[11px] text-[#9fd6e3] hover:underline">Ver en la Wiki ↗</a>`;
+        }
+
+        async function buscarWikipediaParaFicha(nodoId) {
+            const termino = (document.getElementById('etWikiTerm')?.value || nodoId).trim();
+            const r = await llamadaProcedencia(`/api/etimologia_wikipedia/${encodeURIComponent(nodoId)}`, 'POST', { termino });
+            if (!r) return;
+            if (document.getElementById('etWikiResumen')) document.getElementById('etWikiResumen').value = r.wikipedia_resumen || '';
+            if (document.getElementById('etWikiTitulo')) document.getElementById('etWikiTitulo').value = r.wikipedia_titulo || '';
+            if (document.getElementById('etWikiUrl')) document.getElementById('etWikiUrl').value = r.wikipedia_url || '';
+            if (document.getElementById('etWikiIdioma')) document.getElementById('etWikiIdioma').value = r.wikipedia_idioma || '';
+            if (document.getElementById('etWikiTerm') && r.wikipedia_titulo) document.getElementById('etWikiTerm').value = r.wikipedia_titulo;
+            cacheEtimologia[nodoId] = { ...(cacheEtimologia[nodoId] || {}), ficha: r };
         }
 
         async function guardarEtimologia(nodoId) {
@@ -4570,6 +4627,8 @@ def interfaz_web():
             const cuerpo = {
                 origen_nombre: v('etOrigen'), idioma_origen: v('etIdioma'), cultura: v('etCultura'),
                 referencia_real: v('etRef'), resumen_wiki: v('etResumen'),
+                wikipedia_titulo: v('etWikiTitulo'), wikipedia_resumen: v('etWikiResumen'),
+                wikipedia_url: v('etWikiUrl'), wikipedia_idioma: v('etWikiIdioma'),
                 resumen_auto: Boolean(document.getElementById('etResumenAuto')?.checked), referencias
             };
             const r = await llamadaProcedencia(`/api/etimologia/${encodeURIComponent(nodoId)}`, 'PUT', cuerpo);
