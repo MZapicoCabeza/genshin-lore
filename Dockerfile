@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
 
 # Copiar los archivos de la aplicación (sin el archivo .env local)
-COPY --chown=user crawler_entidades.py app_visor.py ./
+COPY --chown=user crawler_entidades.py app_visor.py icono.png favicon.png ./
 
 EXPOSE 7860
 

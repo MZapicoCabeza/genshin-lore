@@ -1419,6 +1419,29 @@ def obtener_padres_e_hijos(entidad_id: str):
         }
 
 
+RUTA_ICONO_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icono.png")
+RUTA_FAVICON_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png")
+
+
+@app.get("/icono.png")
+def obtener_icono_web():
+    ruta = RUTA_ICONO_PNG if os.path.exists(RUTA_ICONO_PNG) else RUTA_FAVICON_PNG
+    if os.path.exists(ruta):
+        with open(ruta, "rb") as f:
+            return Response(content=f.read(), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    return Response(status_code=404)
+
+
+@app.get("/favicon.png")
+@app.get("/favicon.ico")
+def obtener_favicon_web():
+    ruta = RUTA_FAVICON_PNG if os.path.exists(RUTA_FAVICON_PNG) else RUTA_ICONO_PNG
+    if os.path.exists(ruta):
+        with open(ruta, "rb") as f:
+            return Response(content=f.read(), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    return Response(status_code=404)
+
+
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 @app.get("/irminsul", response_class=HTMLResponse)
 def interfaz_web():
@@ -1429,6 +1452,9 @@ def interfaz_web():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Archivo de Teyvat · Enciclopedia de Lore</title>
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <link rel="shortcut icon" type="image/png" href="/favicon.png">
+    <link rel="apple-touch-icon" href="/favicon.png">
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- vis-network -->
@@ -1594,8 +1620,8 @@ def interfaz_web():
     <header class="bg-[#1b202e]/95 border-b-2 border-gi-gold/40 px-5 py-2.5 shrink-0 z-30 shadow-[0_4px_20px_rgba(0,0,0,0.6)]">
         <div class="max-w-[1800px] mx-auto flex flex-wrap items-center justify-between gap-4">
             <div class="flex items-center gap-3.5">
-                <div class="w-10 h-10 rounded-full bg-[#262d40] border-2 border-gi-gold flex items-center justify-center shadow-[0_0_12px_rgba(211,188,142,0.3)]">
-                    <span class="text-gi-goldBright text-lg leading-none">✦</span>
+                <div class="w-11 h-11 rounded-full bg-[#141824] border-2 border-gi-gold flex items-center justify-center shadow-[0_0_14px_rgba(211,188,142,0.35)] p-1 shrink-0">
+                    <img src="/icono.png" alt="Irminsul" class="w-full h-full object-contain drop-shadow-[0_0_6px_rgba(240,220,175,0.45)]">
                 </div>
                 <div>
                     <div class="flex items-center gap-2.5">

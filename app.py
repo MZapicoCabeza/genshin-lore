@@ -34,4 +34,5 @@ with gr.Blocks(css=CSS_FULLSCREEN, title="Archivo del Irminsul · Genshin Impact
 
 if __name__ == "__main__":
     puerto = int(os.getenv("GRADIO_SERVER_PORT", os.getenv("PORT", "7860")))
-    demo.launch(server_name="0.0.0.0", server_port=puerto)
+    ruta_fav = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png")
+    demo.launch(server_name="0.0.0.0", server_port=puerto, favicon_path=ruta_fav if os.path.exists(ruta_fav) else None)

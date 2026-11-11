@@ -95,7 +95,8 @@ NO_ENTIDADES = {
     "cooking", "forging", "alchemy", "serenitea pot", "genius invokation tcg",
     "spiral abyss", "imaginarium theater", "wind glider", "namecard",
     "exploration", "map", "mini-map", "minimap", "main city", "version",
-    "version history", "system", "inventory", "battle pass", "co-op mode",
+    "version history", "system", "game system", "game systems", "comics",
+    "inventory", "battle pass", "co-op mode",
     "photo mode", "loading screen", "tutorial", "tutorials", "furnishing set",
     "furnishing sets", "adeptal energy", "realm currency", "trust rank"
 }
@@ -717,67 +718,103 @@ def calcular_embeddings_lote(textos: list[str]) -> list[list[float]]:
         return []
 
 
-def guardar_en_neo4j(driver, titulo_pagina, texto_web, relaciones, generar_embeddings=True):
-    with driver.session() as session:
-        if titulo_pagina.lower() not in HUBS_INDICE:
-            session.run(
-                """
-                MERGE (e:Entity {id: $id})
-                SET e.url_wiki = $url,
-                    e.texto_web = $texto_web
-                """,
-                id=titulo_pagina,
-                url=f"{WIKI_BASE_URL}{titulo_pagina.replace(' ', '_')}",
-                texto_web=texto_web
-            )
+def crear_driver_neo4j():
+    return GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USER, NEO4J_PASSWORD),
+        max_connection_lifetime=180,
+        keep_alive=True,
+        connection_acquisition_timeout=60,
+    )
 
-            if generar_embeddings and texto_web:
-                chunks = generar_chunks_jerarquicos_small_to_big(titulo_pagina, texto_web)
-                if chunks:
-                    vectores = calcular_embeddings_lote([c["texto_embedding"] for c in chunks])
-                    if len(vectores) == len(chunks):
-                        for c, vec in zip(chunks, vectores):
-                            c["embedding"] = vec
-                        session.run(
-                            """
-                            MATCH (e:Entity {id: $entidad_id})
-                            OPTIONAL MATCH (e)-[old_r:HAS_CHUNK]->(old_c:Chunk)
-                            DETACH DELETE old_c
-                            WITH e
-                            UNWIND $chunks AS ch
-                            MERGE (c:Chunk {id: ch.id})
-                            SET c.entidad_id = ch.entidad_id,
-                                c.seccion = ch.seccion,
-                                c.orden = ch.orden,
-                                c.texto = ch.texto,
-                                c.texto_padre = ch.texto_padre,
-                                c.url_wiki = ch.url_wiki,
-                                c.embedding = ch.embedding
-                            MERGE (e)-[:HAS_CHUNK]->(c)
-                            """,
-                            entidad_id=titulo_pagina,
-                            chunks=chunks,
-                        )
-                        print(f"   🧠 Embeddings Small-to-Big guardados: {len(chunks)} chunks vectorizados.")
 
-        if relaciones:
-            session.run(
-                """
-                UNWIND $rels AS r
-                MERGE (o:Entity {id: r.origen})
-                ON CREATE SET o.url_wiki = $base_url + replace(r.origen, ' ', '_')
-                MERGE (d:Entity {id: r.destino})
-                ON CREATE SET d.url_wiki = $base_url + replace(r.destino, ' ', '_')
-                MERGE (o)-[rel:RELATED_TO {id: r.rel_id}]->(d)
-                SET rel.epoca = r.epoca,
-                    rel.parrafo = r.parrafo,
-                    rel.ref_titulo = r.ref_titulo,
-                    rel.ref_url = r.ref_url,
-                    rel.ref_texto = r.ref_texto
-                """,
-                rels=relaciones,
-                base_url=WIKI_BASE_URL
-            )
+def ejecutar_tx_con_reintento(driver_ref: list, fn_operacion, max_intentos: int = 5):
+    """Ejecuta una operación contra Neo4j reintentando y reconectando automáticamente si hay microcortes de red."""
+    for intento in range(1, max_intentos + 1):
+        try:
+            return fn_operacion(driver_ref[0])
+        except Exception as e:
+            print(f"   ⚠️ Microcorte Neo4j (intento {intento}/{max_intentos}): {e}. Reconectando en 5s...")
+            time.sleep(5)
+            try:
+                driver_ref[0].close()
+            except Exception:
+                pass
+            driver_ref[0] = crear_driver_neo4j()
+    return None
+
+
+def guardar_en_neo4j(driver_or_ref, titulo_pagina, texto_web, relaciones, generar_embeddings=True):
+    driver_ref = driver_or_ref if isinstance(driver_or_ref, list) else [driver_or_ref]
+
+    # Calcular embeddings fuera de la sesión de Neo4j para no dejar la conexión TCP inactiva mientras la CPU vectoriza
+    chunks_con_vec = []
+    if titulo_pagina.lower() not in HUBS_INDICE and generar_embeddings and texto_web:
+        chunks = generar_chunks_jerarquicos_small_to_big(titulo_pagina, texto_web)
+        if chunks:
+            vectores = calcular_embeddings_lote([c["texto_embedding"] for c in chunks])
+            if len(vectores) == len(chunks):
+                for c, vec in zip(chunks, vectores):
+                    c["embedding"] = vec
+                chunks_con_vec = chunks
+
+    def _op_guardar(drv):
+        with drv.session() as session:
+            if titulo_pagina.lower() not in HUBS_INDICE:
+                session.run(
+                    """
+                    MERGE (e:Entity {id: $id})
+                    SET e.url_wiki = $url,
+                        e.texto_web = $texto_web
+                    """,
+                    id=titulo_pagina,
+                    url=f"{WIKI_BASE_URL}{titulo_pagina.replace(' ', '_')}",
+                    texto_web=texto_web,
+                )
+
+                if chunks_con_vec:
+                    session.run(
+                        """
+                        MATCH (e:Entity {id: $entidad_id})
+                        OPTIONAL MATCH (e)-[old_r:HAS_CHUNK]->(old_c:Chunk)
+                        DETACH DELETE old_c
+                        WITH e
+                        UNWIND $chunks AS ch
+                        MERGE (c:Chunk {id: ch.id})
+                        SET c.entidad_id = ch.entidad_id,
+                            c.seccion = ch.seccion,
+                            c.orden = ch.orden,
+                            c.texto = ch.texto,
+                            c.texto_padre = ch.texto_padre,
+                            c.url_wiki = ch.url_wiki,
+                            c.embedding = ch.embedding
+                        MERGE (e)-[:HAS_CHUNK]->(c)
+                        """,
+                        entidad_id=titulo_pagina,
+                        chunks=chunks_con_vec,
+                    )
+                    print(f"   🧠 Embeddings Small-to-Big guardados: {len(chunks_con_vec)} chunks vectorizados.")
+
+            if relaciones:
+                session.run(
+                    """
+                    UNWIND $rels AS r
+                    MERGE (o:Entity {id: r.origen})
+                    ON CREATE SET o.url_wiki = $base_url + replace(r.origen, ' ', '_')
+                    MERGE (d:Entity {id: r.destino})
+                    ON CREATE SET d.url_wiki = $base_url + replace(r.destino, ' ', '_')
+                    MERGE (o)-[rel:RELATED_TO {id: r.rel_id}]->(d)
+                    SET rel.epoca = r.epoca,
+                        rel.parrafo = r.parrafo,
+                        rel.ref_titulo = r.ref_titulo,
+                        rel.ref_url = r.ref_url,
+                        rel.ref_texto = r.ref_texto
+                    """,
+                    rels=relaciones,
+                    base_url=WIKI_BASE_URL,
+                )
+
+    ejecutar_tx_con_reintento(driver_ref, _op_guardar)
 
 
 def asegurar_indices_neo4j(driver):
@@ -877,12 +914,12 @@ def limpiar_base_de_datos(driver):
 
 
 def ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=8000, borrar_antes=True):
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver_ref = [crear_driver_neo4j()]
 
     if borrar_antes:
-        limpiar_base_de_datos(driver)
+        limpiar_base_de_datos(driver_ref[0])
 
-    asegurar_indices_neo4j(driver)
+    asegurar_indices_neo4j(driver_ref[0])
 
     if semilla.lower() not in HUBS_INDICE:
         res_semilla = resolver_redirecciones_wiki([semilla])
@@ -895,7 +932,7 @@ def ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=
     # Si se lanza con borrar_antes=False (modo reanudar), marcar como ya visitadas las que ya tienen texto_web
     # y cargar en la cola los nodos stub pendientes que aún no tienen texto_web
     if not borrar_antes:
-        with driver.session() as session:
+        with driver_ref[0].session() as session:
             ya_hechas = session.run(
                 "MATCH (e:Entity) WHERE e.texto_web IS NOT NULL AND trim(e.texto_web) <> '' RETURN toLower(e.id) AS id"
             ).data()
@@ -919,44 +956,57 @@ def ejecutar_crawler(semilla="Lore", max_profundidad=999, max_paginas_seguridad=
                 continue
             visitados.add(actual.lower())
 
-            es_hub_actual = actual.lower() in HUBS_INDICE
-            if not es_hub_actual and not es_entidad_valida(actual):
-                with driver.session() as s_del:
-                    s_del.run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual)
+            try:
+                es_hub_actual = actual.lower() in HUBS_INDICE
+                if not es_hub_actual and not es_entidad_valida(actual):
+                    ejecutar_tx_con_reintento(
+                        driver_ref,
+                        lambda drv: drv.session().run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual),
+                    )
+                    continue
+
+                wikitext = obtener_wikitexto_lore(actual)
+                if not wikitext or not es_pagina_relevante_para_lore(actual, wikitext):
+                    if not es_hub_actual:
+                        ejecutar_tx_con_reintento(
+                            driver_ref,
+                            lambda drv: drv.session().run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual),
+                        )
+                    continue
+
+                texto_web, relaciones, vecinos = procesar_pagina(actual, wikitext)
+                # Descartar micro-artículos de mecánicas/objetos sin apenas contenido enciclopédico
+                if not es_hub_actual and len(texto_web.strip()) < 420 and len(relaciones) < 3:
+                    ejecutar_tx_con_reintento(
+                        driver_ref,
+                        lambda drv: drv.session().run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual),
+                    )
+                    continue
+
+                paginas_procesadas += 1
+                icono = "🗂️ [HUB]" if es_hub_actual else "👤 [ENTITY]"
+                print(f"[{paginas_procesadas}/{max_paginas_seguridad}] {icono} (Depth {prof}) '{actual}'...")
+                guardar_en_neo4j(driver_ref, actual, texto_web, relaciones)
+                print(f"   💾 Texto enciclopédico ({len(texto_web)} chars) | +{len(relaciones)} relaciones | +{len(vecinos)} entidades.")
+
+                sig_prof = prof if es_hub_actual else prof + 1
+                if sig_prof <= max_profundidad:
+                    for v in vecinos:
+                        if v.lower() not in visitados:
+                            cola.append((v, sig_prof))
+
+                time.sleep(0.2)
+            except Exception as e_pag:
+                print(f"   ⚠️ Error procesando '{actual}', saltando a la siguiente: {e_pag}")
                 continue
-
-            wikitext = obtener_wikitexto_lore(actual)
-            if not wikitext or not es_pagina_relevante_para_lore(actual, wikitext):
-                if not es_hub_actual:
-                    with driver.session() as s_del:
-                        s_del.run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual)
-                continue
-
-            texto_web, relaciones, vecinos = procesar_pagina(actual, wikitext)
-            # Descartar micro-artículos de mecánicas/objetos sin apenas contenido enciclopédico
-            if not es_hub_actual and len(texto_web.strip()) < 420 and len(relaciones) < 3:
-                with driver.session() as s_del:
-                    s_del.run("MATCH (e:Entity {id: $id}) DETACH DELETE e", id=actual)
-                continue
-
-            paginas_procesadas += 1
-            icono = "🗂️ [HUB]" if es_hub_actual else "👤 [ENTITY]"
-            print(f"[{paginas_procesadas}/{max_paginas_seguridad}] {icono} (Depth {prof}) '{actual}'...")
-            guardar_en_neo4j(driver, actual, texto_web, relaciones)
-            print(f"   💾 Texto enciclopédico ({len(texto_web)} chars) | +{len(relaciones)} relaciones | +{len(vecinos)} entidades.")
-
-            sig_prof = prof if es_hub_actual else prof + 1
-            if sig_prof <= max_profundidad:
-                for v in vecinos:
-                    if v.lower() not in visitados:
-                        cola.append((v, sig_prof))
-
-            time.sleep(0.2)
 
     except KeyboardInterrupt:
         print("\n⏸️ Crawler detenido manualmente por el usuario. Todo lo procesado hasta aquí ya está guardado en Neo4j.")
     finally:
-        driver.close()
+        try:
+            driver_ref[0].close()
+        except Exception:
+            pass
         print(f"\n🎉 Finalizado. Páginas procesadas: {paginas_procesadas}.")
 
 
